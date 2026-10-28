@@ -1,0 +1,17 @@
+{
+  "name": "codeassist",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @codeassist/shared && npm run build -w @codeassist/server && npm run build -w @codeassist/mcp-server",
+    "build:shared": "npm run build -w @codeassist/shared",
+    "dev:server": "npm run dev -w @codeassist/server",
+    "start:server": "npm run start -w @codeassist/server",
+    "start:mcp": "npm run start -w @codeassist/mcp-server"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

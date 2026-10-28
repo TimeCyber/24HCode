@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node .cursor/hooks/codeassist-session-start.mjs"
+      }
+    ],
+    "stop": [
+      {
+        "command": "node .cursor/hooks/codeassist-stop.mjs",
+        "loop_limit": 30
+      }
+    ]
+  }
+}

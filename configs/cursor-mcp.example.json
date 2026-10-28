@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "codeassist": {
+      "command": "node",
+      "args": [
+        "D:/androidproject/CodeAssit/packages/mcp-server/run.mjs"
+      ],
+      "env": {
+        "CODEASSIST_SERVER_URL": "http://127.0.0.1:8787",
+        "CODEASSIST_TOKEN": "codeassist-dev-token",
+        "CODEASSIST_IDE": "cursor",
+        "CODEASSIST_WORKSPACE": "${workspaceFolder}",
+        "CODEASSIST_MCP_BUILD": "0.3.3"
+      }
+    }
+  }
+}

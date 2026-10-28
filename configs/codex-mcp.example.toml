@@ -1,0 +1,14 @@
+# Codex MCP 配置示例（按本机 Codex 配置文件格式粘贴/合并）
+# 将路径改成你本机仓库的绝对路径；TOKEN 须与中继 ACCESS_TOKEN 一致
+
+[mcp_servers.codeassist]
+command = "node"
+args = ["D:/androidproject/CodeAssit/packages/mcp-server/run.mjs"]
+
+[mcp_servers.codeassist.env]
+CODEASSIST_SERVER_URL = "http://127.0.0.1:8787"
+CODEASSIST_TOKEN = "codeassist-dev-token"
+CODEASSIST_IDE = "codex"
+# 建议填当前项目绝对路径；也可用 "."（取决于 Codex 启动 cwd）
+CODEASSIST_WORKSPACE = "D:/androidproject/CodeAssit"
+CODEASSIST_MCP_BUILD = "0.3.3"

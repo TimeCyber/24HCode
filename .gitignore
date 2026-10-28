@@ -1,0 +1,31 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+packages/server/data/
+.codeassist/
+.env
+.env.local
+mobile/.dart_tool/
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+mobile/build/
+mobile/.idea/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+*.iml
+.idea/
+# Local MCP machine paths / tokens — keep examples in configs/
+.cursor/mcp.json
+*.apk
+*.aab
+packages/*/dist/
+# Local scratch / build logs
+_*.bat
+_*.txt
+mobile/_*.bat
+mobile/_*.txt
+mobile/build_*.txt
+mobile/_pack_log.txt
