@@ -55,10 +55,15 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
-        <!-- 语音识别服务 -->
+        <!-- 语音识别服务 / 系统语音 Activity（华为需走 Intent，勿 bind FakeRecognitionService） -->
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <package android:name="com.google.android.googlequicksearchbox" />
+        <package android:name="com.huawei.vassistant" />
         <!-- Android 11+ 允许 url_launcher 打开网页 -->
         <intent>
             <action android:name="android.intent.action.VIEW" />

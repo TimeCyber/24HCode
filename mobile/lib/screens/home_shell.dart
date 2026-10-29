@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../widgets/session_status_sheet.dart';
+import 'crash_log_screen.dart';
 import 'prompts_tab.dart';
 import 'setup_screen.dart';
 
@@ -66,6 +67,15 @@ class HomeShell extends StatelessWidget {
                 ),
               ),
             ),
+          IconButton(
+            tooltip: '闪退日志',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const CrashLogScreen()),
+              );
+            },
+            icon: const Icon(Icons.bug_report_outlined),
+          ),
           IconButton(
             tooltip: '本会话状态',
             onPressed: () => showSessionStatusSheet(context),

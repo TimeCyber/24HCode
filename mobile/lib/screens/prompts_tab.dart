@@ -9,11 +9,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:speech_to_text/speech_to_text.dart' as stt;
-
 import '../app_state.dart';
+import '../crash_log_service.dart';
 import '../ide_labels.dart';
 import '../models.dart';
+import '../safe_speech.dart';
 import '../widgets/linkified_text.dart';
 
 class PromptsTab extends StatefulWidget {
@@ -468,22 +468,17 @@ class _ComposerBar extends StatefulWidget {
 }
 
 class _ComposerBarState extends State<_ComposerBar> {
-  final stt.SpeechToText _speech = stt.SpeechToText();
-  bool _speechReady = false;
   bool _listening = false;
   bool _voiceBusy = false;
-  String _liveSpeech = '';
-  String _prefixBeforeSpeech = '';
-  /// 安卓 10 上 locales() / 复杂 locale 易闪退，固定简体
-  static const _localeId = 'zh_CN';
+  bool _fingerDown = false;
+  Timer? _longPressTimer;
+  int? _activePointer;
 
   String get _hint {
-    if (_listening) {
-      return _liveSpeech.isEmpty ? '正在听…再点麦克风结束' : _liveSpeech;
-    }
+    if (_listening) return '正在打开系统语音…';
     if (!widget.hasProject) return '请先右上角连接 AI 项目';
     if (widget.sending) return '正在发送…';
-    return '输入指令给 ${widget.ideLabel}…';
+    return '输入指令，长按语音';
   }
 
   void _safeSetState(VoidCallback fn) {
@@ -503,146 +498,117 @@ class _ComposerBarState extends State<_ComposerBar> {
     } catch (_) {}
   }
 
-  Future<bool> _ensureSpeech() async {
+  void _appendSpeech(String words) {
+    final text = words.trim();
+    if (text.isEmpty) return;
+    var prefix = widget.controller.text;
+    if (prefix.isNotEmpty &&
+        !prefix.endsWith(' ') &&
+        !prefix.endsWith('\n')) {
+      prefix = '$prefix ';
+    }
+    final next = '$prefix$text';
+    try {
+      widget.controller.value = TextEditingValue(
+        text: next,
+        selection: TextSelection.collapsed(offset: next.length),
+      );
+    } catch (_) {}
+  }
+
+  /// 华为安卓10：SpeechRecognizer 会 bind FakeRecognitionService 直接闪退。
+  /// 改为系统 RecognizerIntent（弹系统语音界面）。
+  Future<void> _startSafeVoice() async {
+    if (!widget.enabled || _listening || _voiceBusy) return;
+    if (!Platform.isAndroid) {
+      _snack('当前仅安卓支持语音输入');
+      return;
+    }
+    _voiceBusy = true;
+    unawaited(CrashLogService.instance.log('voice', 'safeSpeech begin'));
+
     var mic = await Permission.microphone.status;
     if (!mic.isGranted) {
       mic = await Permission.microphone.request();
     }
     if (!mic.isGranted) {
+      _voiceBusy = false;
       _snack('需要麦克风权限才能语音输入');
       try {
         await openAppSettings();
       } catch (_) {}
-      return false;
+      return;
     }
-    if (_speechReady && _speech.isAvailable) return true;
+
     try {
-      // 安卓 10(SDK29)：stop 默认会 destroy 识别器易闪退；关蓝牙；OEM 需 intentLookup
-      _speechReady = await _speech.initialize(
-        onError: (e) {
-          _voiceBusy = false;
-          _safeSetState(() => _listening = false);
-          _snack('语音识别错误：${e.errorMsg}');
-        },
-        onStatus: (status) {
-          if (status == 'done' || status == 'notListening') {
-            _voiceBusy = false;
-            _safeSetState(() => _listening = false);
-          }
-        },
-        options: [
-          stt.SpeechToText.androidNoBluetooth,
-          stt.SpeechToText.androidIntentLookup,
-          stt.SpeechToText.androidAlwaysUseStop,
-        ],
+      widget.focusNode.unfocus();
+      await SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
+    } catch (_) {}
+
+    _safeSetState(() => _listening = true);
+    try {
+      await HapticFeedback.lightImpact();
+    } catch (_) {}
+
+    try {
+      unawaited(CrashLogService.instance.log('voice', 'before safe recognize'));
+      final text = await SafeSpeech.recognize(
+        locale: 'zh-CN',
+        prompt: '请说出要发给 AI 的指令',
       );
-    } catch (e) {
-      _speechReady = false;
-      _snack('语音初始化失败：$e');
-      return false;
-    }
-    if (!_speechReady && mounted) {
-      _snack('本机不支持语音识别，请安装/启用系统语音服务后重试');
-    }
-    return _speechReady;
-  }
-
-  Future<void> _startVoice() async {
-    if (!widget.enabled || _listening || _voiceBusy) return;
-    _voiceBusy = true;
-    try {
-      final ok = await _ensureSpeech();
-      if (!ok || !mounted) {
-        _voiceBusy = false;
-        return;
-      }
-
-      _prefixBeforeSpeech = widget.controller.text;
-      if (_prefixBeforeSpeech.isNotEmpty &&
-          !_prefixBeforeSpeech.endsWith(' ') &&
-          !_prefixBeforeSpeech.endsWith('\n')) {
-        _prefixBeforeSpeech = '$_prefixBeforeSpeech ';
-      }
-      _safeSetState(() {
-        _listening = true;
-        _liveSpeech = '';
-      });
-      try {
-        await HapticFeedback.lightImpact();
-      } catch (_) {}
-      _snack('正在录音，再点麦克风结束');
-
-      // confirmation 比 dictation 稳；cancelOnError=false 避免 native 竞态闪退
-      await _speech.listen(
-        onResult: (result) {
-          if (!mounted) return;
-          final words = result.recognizedWords.trim();
-          _liveSpeech = words;
-          final next = '$_prefixBeforeSpeech$words';
-          try {
-            widget.controller.value = TextEditingValue(
-              text: next,
-              selection: TextSelection.collapsed(offset: next.length),
-            );
-          } catch (_) {}
-          _safeSetState(() {});
-          if (result.finalResult) {
-            _voiceBusy = false;
-            _safeSetState(() => _listening = false);
-          }
-        },
-        listenOptions: stt.SpeechListenOptions(
-          listenFor: const Duration(seconds: 60),
-          pauseFor: const Duration(seconds: 3),
-          partialResults: true,
-          cancelOnError: false,
-          listenMode: stt.ListenMode.confirmation,
-          localeId: _localeId,
+      unawaited(
+        CrashLogService.instance.log(
+          'voice',
+          'safe recognize done len=${text.length}',
         ),
       );
-    } catch (e) {
-      _safeSetState(() => _listening = false);
-      _snack('无法开始录音：$e');
-    } finally {
-      // listen 已启动后由 stop/status 清 busy；若未进入 listening 则在此清
-      if (!_listening) _voiceBusy = false;
-    }
-  }
-
-  Future<void> _stopVoice() async {
-    if (_voiceBusy && !_speech.isListening) {
-      // 识别器还在启动中，稍后再停，避免安卓 10 destroy/stop 竞态闪退
-      await Future<void>.delayed(const Duration(milliseconds: 400));
-    }
-    try {
-      if (_speech.isListening) {
-        await _speech.stop();
+      if (text.isEmpty) {
+        _snack('未识别到内容');
+      } else {
+        _appendSpeech(text);
       }
-    } catch (_) {
-      try {
-        await _speech.cancel();
-      } catch (_) {}
+    } on PlatformException catch (e, st) {
+      unawaited(CrashLogService.instance.logError('safe_speech', e, st));
+      final msg = e.message ?? e.code;
+      _snack(
+        msg.contains('谷歌') || e.code == 'no_speech'
+            ? msg
+            : '语音失败：$msg（华为机请安装谷歌或系统语音输入）',
+      );
+    } catch (e, st) {
+      unawaited(CrashLogService.instance.logError('safe_speech', e, st));
+      _snack('语音失败：$e');
+    } finally {
+      _voiceBusy = false;
+      _safeSetState(() => _listening = false);
+      unawaited(CrashLogService.instance.log('voice', 'safeSpeech end'));
     }
-    _voiceBusy = false;
-    _safeSetState(() => _listening = false);
   }
 
-  Future<void> _toggleMic() async {
-    if (!widget.enabled || _voiceBusy && !_listening) return;
-    if (_listening || _speech.isListening) {
-      await _stopVoice();
-    } else {
-      await _startVoice();
-    }
+  void _onPointerDown(PointerDownEvent e) {
+    if (!widget.enabled || _listening || _voiceBusy) return;
+    _fingerDown = true;
+    _activePointer = e.pointer;
+    _longPressTimer?.cancel();
+    _longPressTimer = Timer(const Duration(milliseconds: 480), () {
+      if (!mounted || !_fingerDown || _activePointer == null) return;
+      unawaited(CrashLogService.instance.log('voice', 'longPress fired'));
+      unawaited(_startSafeVoice());
+    });
+  }
+
+  void _onPointerUpOrCancel(PointerEvent e) {
+    if (_activePointer != null && e.pointer != _activePointer) return;
+    _fingerDown = false;
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    _activePointer = null;
+    // Intent 语音由系统界面接管，松手不再 stop（避免误取消）
   }
 
   @override
   void dispose() {
-    try {
-      if (_speech.isListening) {
-        unawaited(_speech.cancel());
-      }
-    } catch (_) {}
+    _longPressTimer?.cancel();
     super.dispose();
   }
 
@@ -675,72 +641,79 @@ class _ComposerBarState extends State<_ComposerBar> {
               ),
               const SizedBox(width: 8),
               Expanded(
-                // 安卓 10：不要在 TextField 上长按触发语音（选区冲突 + stop 竞态易闪退）
-                child: TextField(
-                  controller: widget.controller,
-                  focusNode: widget.focusNode,
-                  minLines: 1,
-                  maxLines: 6,
-                  enabled: enabled,
-                  readOnly: _listening,
-                  enableInteractiveSelection: !_listening,
-                  textInputAction: TextInputAction.newline,
-                  keyboardType: TextInputType.multiline,
-                  textCapitalization: TextCapitalization.sentences,
-                  style: Theme.of(context).textTheme.bodyLarge,
-                  decoration: InputDecoration(
-                    hintText: _hint,
-                    filled: true,
-                    fillColor: _listening
-                        ? scheme.primaryContainer.withValues(alpha: 0.55)
-                        : enabled
-                            ? scheme.surfaceContainerHighest.withValues(
-                                alpha: 0.72,
-                              )
-                            : scheme.surfaceContainerHighest.withValues(
-                                alpha: 0.35,
-                              ),
-                    prefixIcon: _listening
-                        ? Icon(Icons.mic, color: scheme.primary)
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: enabled ? _onPointerDown : null,
+                  onPointerUp: _onPointerUpOrCancel,
+                  onPointerCancel: _onPointerUpOrCancel,
+                  child: TextField(
+                    controller: widget.controller,
+                    focusNode: widget.focusNode,
+                    minLines: 1,
+                    maxLines: 6,
+                    enabled: enabled,
+                    // 录音中只读，避免安卓10选区/输入法与语音冲突闪退
+                    readOnly: _listening,
+                    enableInteractiveSelection: !_listening,
+                    contextMenuBuilder: _listening
+                        ? (context, editableTextState) =>
+                            const SizedBox.shrink()
                         : null,
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 12,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(22),
-                      borderSide: BorderSide.none,
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(22),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(22),
-                      borderSide: BorderSide(
-                        color: scheme.primary.withValues(alpha: 0.45),
-                        width: 1.5,
+                    textInputAction: TextInputAction.newline,
+                    keyboardType: TextInputType.multiline,
+                    textCapitalization: TextCapitalization.sentences,
+                    style: Theme.of(context).textTheme.bodyLarge,
+                    decoration: InputDecoration(
+                      hintText: _hint,
+                      filled: true,
+                      fillColor: _listening
+                          ? scheme.primaryContainer.withValues(alpha: 0.55)
+                          : enabled
+                              ? scheme.surfaceContainerHighest.withValues(
+                                  alpha: 0.72,
+                                )
+                              : scheme.surfaceContainerHighest.withValues(
+                                  alpha: 0.35,
+                                ),
+                      prefixIcon: _listening
+                          ? Icon(Icons.mic, color: scheme.primary)
+                          : null,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
                       ),
-                    ),
-                    disabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(22),
-                      borderSide: BorderSide.none,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide.none,
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide.none,
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide(
+                          color: scheme.primary.withValues(alpha: 0.45),
+                          width: 1.5,
+                        ),
+                      ),
+                      disabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide.none,
+                      ),
                     ),
                   ),
                 ),
               ),
               const SizedBox(width: 6),
               AnimatedOpacity(
-                opacity: widget.canSend || widget.sending || _listening ? 1 : 0.45,
+                opacity: widget.canSend || widget.sending ? 1 : 0.45,
                 duration: const Duration(milliseconds: 160),
                 child: IconButton.filled(
-                  tooltip: _listening ? '结束语音' : '发送',
-                  onPressed: _listening
-                      ? () => unawaited(_stopVoice())
-                      : (widget.canSend ? widget.onSend : null),
+                  tooltip: '发送',
+                  onPressed: widget.canSend ? widget.onSend : null,
                   style: IconButton.styleFrom(
                     minimumSize: const Size(48, 48),
-                    backgroundColor: _listening ? scheme.error : null,
                   ),
                   icon: widget.sending
                       ? SizedBox(
@@ -751,9 +724,7 @@ class _ComposerBarState extends State<_ComposerBar> {
                             color: scheme.onPrimary,
                           ),
                         )
-                      : Icon(
-                          _listening ? Icons.stop_rounded : Icons.send_rounded,
-                        ),
+                      : const Icon(Icons.send_rounded),
                 ),
               ),
             ],

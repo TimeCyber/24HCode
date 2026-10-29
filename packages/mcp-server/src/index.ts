@@ -498,6 +498,7 @@ async function main() {
     startLivePull(api, {
       serverUrl: SERVER_URL,
       token: TOKEN,
+      ide: IDE === "codex" ? "codex" : "cursor",
       getProjectId: () => project?.id ?? null,
       getWorkspace: () => currentWorkspace(),
       onPrompts: (prompts) => {

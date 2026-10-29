@@ -52,6 +52,8 @@ function killProcessTree(child: ChildProcess) {
 type Options = {
   serverUrl: string;
   token: string;
+  /** cursor | codex — 决定拉起哪套 Agent CLI */
+  ide?: "cursor" | "codex";
   getProjectId: () => string | null;
   getWorkspace: () => string;
   onPrompts: (prompts: PromptDelivery[]) => void;
@@ -157,8 +159,12 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
         console.error(
           `[codeassist-mcp] 串行执行手机指令 (${prompts.length}) → 完成后自动接下一条`,
         );
-        notifyToast(`CodeAssist：正在 Cursor 执行手机指令`);
-        focusCursorWorkspace(opts.getWorkspace());
+        const ide = opts.ide === "codex" ? "codex" : "cursor";
+        const ideLabel = ide === "codex" ? "Codex" : "Cursor";
+        notifyToast(`CodeAssist：正在 ${ideLabel} 执行手机指令`);
+        if (ide === "cursor") {
+          focusCursorWorkspace(opts.getWorkspace());
+        }
 
         for (const p of prompts) {
           try {
@@ -175,7 +181,7 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
             projectId,
             chatSessionId,
             summary: `正在执行手机指令：${prompts.map((p) => p.content).join(" | ").slice(0, 200)}`,
-            currentStep: "Cursor Agent 执行中",
+            currentStep: `${ideLabel} Agent 执行中`,
             openFiles: [],
             status: "coding",
           })
@@ -220,23 +226,37 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
               projectId,
               chatSessionId,
               summary: `手机指令执行中（仍有进度）：${prompts.map((p) => p.content).join(" | ").slice(0, 160)}`,
-              currentStep: "Cursor Agent 执行中（活跃）",
+              currentStep: `${ideLabel} Agent 执行中（活跃）`,
               openFiles: [],
               status: "coding",
             })
             .catch(() => undefined);
         };
         try {
+          const runAgent =
+            ide === "codex"
+              ? () =>
+                  runCodexAgent(
+                    opts.getWorkspace(),
+                    enrichedContents,
+                    prompts.map((p) => p.id),
+                    resumeChatId,
+                    idleMs,
+                    maxMs,
+                    heartbeat,
+                  )
+              : () =>
+                  runCursorAgent(
+                    opts.getWorkspace(),
+                    enrichedContents,
+                    prompts.map((p) => p.id),
+                    resumeChatId,
+                    idleMs,
+                    maxMs,
+                    heartbeat,
+                  );
           agentResult = await Promise.race([
-            runCursorAgent(
-              opts.getWorkspace(),
-              enrichedContents,
-              prompts.map((p) => p.id),
-              resumeChatId,
-              idleMs,
-              maxMs,
-              heartbeat,
-            ).finally(() => {
+            runAgent().finally(() => {
               if (hardTimer) clearTimeout(hardTimer);
             }),
             new Promise<AgentRunResult>((resolve) => {
@@ -671,6 +691,254 @@ function runCursorAgent(
         extractResultText(raw) || "Agent 已执行完成（无文本输出）",
         cursorChatId,
       );
+    });
+  });
+}
+
+function findCodexCmd(): string | null {
+  const override = process.env.CODEASSIST_CODEX_CMD?.trim();
+  if (override && fs.existsSync(override)) return override;
+  const local = process.env.LOCALAPPDATA ?? "";
+  const binRoot = path.join(local, "OpenAI", "Codex", "bin");
+  if (fs.existsSync(binRoot)) {
+    try {
+      const dirs = fs
+        .readdirSync(binRoot, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name)
+        .sort()
+        .reverse();
+      for (const name of dirs) {
+        const exe = path.join(binRoot, name, "codex.exe");
+        if (fs.existsSync(exe)) return exe;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  const fallbacks = [
+    path.join(local, "OpenAI", "Codex", "codex.exe"),
+    "codex.exe",
+    "codex",
+  ];
+  for (const c of fallbacks) {
+    if (c === "codex" || c === "codex.exe") return c;
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+function extractCodexLastMessage(raw: string, outFile?: string): string {
+  if (outFile) {
+    try {
+      if (fs.existsSync(outFile)) {
+        const t = fs.readFileSync(outFile, "utf8").trim();
+        if (t) return t;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  // --json 输出 JSONL：取最后一条带 message/text/content 的
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const obj = JSON.parse(lines[i]!) as Record<string, unknown>;
+      for (const key of ["last_agent_message", "message", "text", "content", "result"]) {
+        const v = obj[key];
+        if (typeof v === "string" && v.trim()) return v.trim();
+      }
+      const item = obj.item as Record<string, unknown> | undefined;
+      if (item && typeof item.text === "string" && item.text.trim()) {
+        return item.text.trim();
+      }
+    } catch {
+      /* continue */
+    }
+  }
+  return extractResultText(raw);
+}
+
+function runCodexAgent(
+  workspace: string,
+  contents: string[],
+  deliveryIds: string[],
+  resumeChatId?: string,
+  idleTimeoutMs: number = agentIdleTimeoutMs(),
+  maxTimeoutMs: number = agentMaxTimeoutMs(),
+  onActivity?: () => void,
+): Promise<AgentRunResult> {
+  return new Promise((resolve) => {
+    const codex = findCodexCmd();
+    if (!codex) {
+      resolve({
+        text: "[agent-error] 未找到 Codex CLI。请确认已安装 OpenAI Codex 桌面版，或设置 CODEASSIST_CODEX_CMD。",
+      });
+      return;
+    }
+
+    const prompt =
+      `你正在 Codex 中执行【手机客户端发来的指令】，必须像本地用户在 IDE 发 Prompt 一样认真改代码、跑命令。\n` +
+      `要求：\n` +
+      `1. 直接执行下列指令（不要只口头说明）\n` +
+      `2. 过程中可用 MCP codeassist：ack_prompt / sync_session_context\n` +
+      `3. 结束后用中文写清：做了什么、改了哪些文件、结果如何（这段会同步给手机）\n\n` +
+      contents.map((c, i) => `### 指令 ${i + 1}\n${c}`).join("\n\n") +
+      (deliveryIds.length ? `\n\nDeliveryIds: ${deliveryIds.join(", ")}` : "");
+
+    let promptArg = prompt;
+    let promptFile: string | null = null;
+    if (Buffer.byteLength(prompt, "utf8") > 6000) {
+      promptFile = path.join(
+        workspace,
+        `.codeassist-prompt-${Date.now()}.txt`,
+      );
+      try {
+        fs.writeFileSync(promptFile, prompt, "utf8");
+        promptArg = `请读取并严格执行文件中的指令：${promptFile}`;
+      } catch {
+        promptFile = null;
+      }
+    }
+
+    const outFile = path.join(
+      workspace,
+      `.codeassist`,
+      `codex-last-${Date.now()}.txt`,
+    );
+    try {
+      fs.mkdirSync(path.dirname(outFile), { recursive: true });
+    } catch {
+      /* ignore */
+    }
+
+    // 新会话执行（Codex resume 子命令参数与 prompt 组合不稳定，先走干净 exec）
+    const args = [
+      "exec",
+      "-C",
+      workspace,
+      "-s",
+      "danger-full-access",
+      "--json",
+      "-o",
+      outFile,
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      promptArg,
+    ];
+    if (resumeChatId) {
+      console.error(
+        `[codeassist-mcp] Codex 忽略 resume=${resumeChatId}，使用新 exec 会话`,
+      );
+    }
+
+    console.error(
+      `[codeassist-mcp] Codex 执行中(idle=${Math.round(idleTimeoutMs / 1000)}s, max=${Math.round(maxTimeoutMs / 1000)}s): ${codex}`,
+    );
+
+    let out = "";
+    let err = "";
+    let settled = false;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let maxTimer: ReturnType<typeof setTimeout> | undefined;
+    let killWaitTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearTimers = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (maxTimer) clearTimeout(maxTimer);
+      if (killWaitTimer) clearTimeout(killWaitTimer);
+    };
+
+    const finish = (text: string, cursorChatId?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      for (const f of [promptFile, outFile]) {
+        if (!f) continue;
+        try {
+          fs.unlinkSync(f);
+        } catch {
+          /* ignore */
+        }
+      }
+      resolve({ text, cursorChatId });
+    };
+
+    // resume 子命令参数形态不同：若带 resume 用 `codex exec resume <id> ...`
+    // 上面把 resume 插在 exec 后；再检查实际 argv
+    const child = spawn(codex, args, {
+      cwd: workspace,
+      shell: false,
+      windowsHide: true,
+      env: { ...process.env, CI: process.env.CI || "1", NO_COLOR: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const abortForTimeout = (reason: string) => {
+      if (settled) return;
+      console.error(`[codeassist-mcp] Codex ${reason}，taskkill 进程树`);
+      killProcessTree(child);
+      killWaitTimer = setTimeout(() => {
+        if (settled) return;
+        killProcessTree(child);
+        const partial = [out, err].filter(Boolean).join("\n").trim();
+        finish(
+          `[agent-error] ${reason}，已中止以免阻塞后续手机指令\n${
+            extractCodexLastMessage(partial, outFile) || "(无输出)"
+          }`,
+          extractCursorChatId(partial) ?? resumeChatId,
+        );
+      }, 8_000);
+    };
+
+    const armIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        abortForTimeout(
+          `空闲超时(${Math.round(idleTimeoutMs / 1000)}s无输出)`,
+        );
+      }, idleTimeoutMs);
+    };
+    armIdleTimer();
+    maxTimer = setTimeout(() => {
+      abortForTimeout(`绝对上限(${Math.round(maxTimeoutMs / 1000)}s)`);
+    }, maxTimeoutMs);
+
+    const noteActivity = () => {
+      if (settled) return;
+      armIdleTimer();
+      try {
+        onActivity?.();
+      } catch {
+        /* ignore */
+      }
+    };
+
+    child.stdout?.on("data", (d: Buffer) => {
+      out += d.toString("utf8");
+      noteActivity();
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      err += d.toString("utf8");
+      noteActivity();
+    });
+    child.on("error", (e) => {
+      finish(`[agent-error] ${e.message}`);
+    });
+    child.on("close", (code) => {
+      const raw = [out, err].filter(Boolean).join("\n").trim();
+      const sessionId = extractCursorChatId(raw) ?? resumeChatId;
+      const text = extractCodexLastMessage(raw, outFile);
+      if (code !== 0 && !text) {
+        finish(`[agent-error] codex exited ${code}`, sessionId);
+        return;
+      }
+      if (code !== 0) {
+        finish(`[agent-error] exit=${code}\n${text}`, sessionId);
+        return;
+      }
+      finish(text || "Codex 已执行完成（无文本输出）", sessionId);
     });
   });
 }

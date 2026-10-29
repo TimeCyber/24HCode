@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "bridge:codex": "node dist/bridge.js",
     "dev": "tsx src/index.ts"
   },
   "dependencies": {

@@ -1,14 +1,15 @@
-# Codex MCP 配置示例（按本机 Codex 配置文件格式粘贴/合并）
-# 将路径改成你本机仓库的绝对路径；TOKEN 须与中继 ACCESS_TOKEN 一致
+# Codex MCP 配置示例（也可直接：codex mcp add ...）
+# TOKEN 须与中继 ACCESS_TOKEN 一致；IDE 必须为 codex
 
 [mcp_servers.codeassist]
-command = "node"
+command = 'C:\nvm4w\nodejs\node.exe'
 args = ["D:/androidproject/CodeAssit/packages/mcp-server/run.mjs"]
 
 [mcp_servers.codeassist.env]
 CODEASSIST_SERVER_URL = "http://127.0.0.1:8787"
 CODEASSIST_TOKEN = "codeassist-dev-token"
 CODEASSIST_IDE = "codex"
-# 建议填当前项目绝对路径；也可用 "."（取决于 Codex 启动 cwd）
 CODEASSIST_WORKSPACE = "D:/androidproject/CodeAssit"
-CODEASSIST_MCP_BUILD = "0.3.3"
+CODEASSIST_MCP_BUILD = "0.3.5-codex"
+# 可选：指定 Codex CLI
+# CODEASSIST_CODEX_CMD = "C:/Users/Administrator/AppData/Local/OpenAI/Codex/bin/<hash>/codex.exe"

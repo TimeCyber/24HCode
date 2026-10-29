@@ -21,6 +21,8 @@ mobile/ios/.symlinks/
 .cursor/mcp.json
 *.apk
 *.aab
+# 允许仓库 releases 目录托管发布用 APK
+!releases/**/*.apk
 packages/*/dist/
 # Local scratch / build logs
 _*.bat

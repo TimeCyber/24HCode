@@ -6,15 +6,22 @@ import 'package:provider/provider.dart';
 
 import 'app_state.dart';
 import 'background_watch_service.dart';
+import 'crash_log_service.dart';
 import 'notification_service.dart';
 import 'screens/home_shell.dart';
 import 'screens/setup_screen.dart';
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await NotificationService.instance.init();
-  await BackgroundWatchService.init();
-  runApp(const CodeAssistApp());
+  await runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    CrashLogService.instance.installHooks();
+    await CrashLogService.instance.init();
+    await NotificationService.instance.init();
+    await BackgroundWatchService.init();
+    runApp(const CodeAssistApp());
+  }, (error, stack) {
+    unawaited(CrashLogService.instance.logError('Zone', error, stack));
+  });
 }
 
 class CodeAssistApp extends StatelessWidget {
@@ -76,6 +83,7 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final fg = state == AppLifecycleState.resumed;
     unawaited(BackgroundWatchService.setAppForeground(fg));
+    unawaited(CrashLogService.instance.log('lifecycle', state.name));
     if (fg && mounted) {
       final app = context.read<AppState>();
       if (app.configured) {
