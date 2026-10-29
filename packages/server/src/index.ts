@@ -28,6 +28,13 @@ const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
 const DB_PATH = process.env.DB_PATH ?? path.join(DATA_DIR, "codeassist.db");
 const FILES_DIR = process.env.FILES_DIR ?? path.join(DATA_DIR, "files");
 const OFFLINE_MS = Number(process.env.OFFLINE_MS ?? 120_000);
+/**
+ * 指令卡在 running/delivered 且长时间无心跳则自动失败。
+ * 默认 50 分钟：对齐 Agent 绝对上限，避免正常长任务被服务端误杀。
+ */
+const PROMPT_STALE_MS = Number(
+  process.env.PROMPT_STALE_MS ?? 50 * 60 * 1000,
+);
 fs.mkdirSync(FILES_DIR, { recursive: true });
 
 const auth = createAuth(ACCESS_TOKEN);
@@ -378,6 +385,20 @@ setInterval(() => {
   }
 }, Math.min(OFFLINE_MS, 10_000));
 
+setInterval(() => {
+  const stale = store.failStalePromptDeliveries(
+    PROMPT_STALE_MS,
+    `执行超时（超过 ${Math.round(PROMPT_STALE_MS / 1000)} 秒仍无结果），已自动失败。请重新发送指令。`,
+  );
+  for (const d of stale) {
+    hub.broadcast("prompt.updated", d, d.projectId);
+    app.log.warn(
+      { deliveryId: d.id, projectId: d.projectId },
+      "stale prompt auto-failed",
+    );
+  }
+}, 30_000);
+
 app.log.info(
-  `CodeAssist server listening on http://${HOST}:${PORT} (token configured)`,
+  `CodeAssist server listening on http://${HOST}:${PORT} (token configured, promptStaleMs=${PROMPT_STALE_MS})`,
 );

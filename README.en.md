@@ -4,6 +4,8 @@ English | [中文](README.md)
 
 ## What it is
 
+> **The last mile of AI tooling (PC → phone)**
+
 **CodeAssist is a companion app that lets you connect to Cursor or Codex on your PC anytime, anywhere—and keep coding.**
 
 You don’t have to sit at the desk. Open the app on your phone, pick an online Cursor/Codex project, and send prompts just like in the IDE. The PC agent actually runs the work; results sync back to your phone.

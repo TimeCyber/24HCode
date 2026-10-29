@@ -28,7 +28,7 @@ let resolvedWorkspace: string | null = null;
 
 const server = new McpServer({
   name: "codeassist",
-  version: "0.3.3",
+  version: "0.3.5",
 });
 
 function uriToPath(uri: string): string | null {
@@ -105,37 +105,72 @@ function resolveWorkspaceFallback(): string {
   return cwd;
 }
 
+function envWorkspaceIfExplicit(): string | null {
+  // Only trust env when Cursor actually expanded ${workspaceFolder}.
+  // Unresolved placeholders and bare process.cwd() must NOT win over listRoots —
+  // otherwise a reused MCP / wrong launch cwd registers the wrong project (e.g. server).
+  const candidates = [
+    process.env.CODEASSIST_WORKSPACE,
+    process.env.WORKSPACE_FOLDER,
+    process.env.CURSOR_PROJECT_DIR,
+    process.env.VSCODE_WORKSPACE_FOLDER,
+  ];
+  for (const raw of candidates) {
+    if (!raw || isUnresolvedPlaceholder(raw)) continue;
+    try {
+      const resolved = normalizeWorkspacePath(path.resolve(raw.trim()));
+      if (fs.existsSync(resolved) && !isLikelyHomeDir(resolved)) return resolved;
+    } catch {
+      /* ignore */
+    }
+  }
+  const multi =
+    process.env.WORKSPACE_FOLDER_PATHS ||
+    process.env.VSCODE_WORKSPACE_FOLDER ||
+    "";
+  return firstExistingPath(
+    multi
+      .split(/[;,\n]/)
+      .map((s) => s.trim())
+      .filter((s) => s && !isUnresolvedPlaceholder(s)),
+  );
+}
+
 async function refreshWorkspaceFromClient(): Promise<string> {
-  // Prefer explicit env from mcp.json (${workspaceFolder}) — most reliable on Windows.
-  const fromEnv = resolveWorkspaceFallback();
-  if (fromEnv && !isLikelyHomeDir(fromEnv)) {
+  const fromEnv = envWorkspaceIfExplicit();
+  if (fromEnv) {
     resolvedWorkspace = fromEnv;
-    console.error(`[codeassist-mcp] workspace from env/cwd: ${fromEnv}`);
+    console.error(`[codeassist-mcp] workspace from env: ${fromEnv}`);
     return fromEnv;
   }
 
+  // Prefer Cursor-reported roots (correct after Open Folder / window switch)
   try {
     const result = await server.server.listRoots(undefined, { timeout: 3000 });
     const roots = result.roots ?? [];
     for (const root of roots) {
       const p = uriToPath(root.uri);
       if (p && fs.existsSync(p) && !isLikelyHomeDir(p)) {
-        resolvedWorkspace = p;
-        console.error(`[codeassist-mcp] workspace from roots: ${p}`);
-        return p;
+        resolvedWorkspace = normalizeWorkspacePath(p);
+        console.error(`[codeassist-mcp] workspace from roots: ${resolvedWorkspace}`);
+        return resolvedWorkspace;
       }
     }
   } catch (err) {
     console.error("[codeassist-mcp] listRoots failed:", err);
   }
 
-  resolvedWorkspace = fromEnv || path.resolve(process.cwd());
-  console.error(`[codeassist-mcp] workspace last resort: ${resolvedWorkspace}`);
+  const cwd = normalizeWorkspacePath(path.resolve(process.cwd()));
+  resolvedWorkspace = cwd;
+  console.error(
+    `[codeassist-mcp] workspace last resort cwd=${cwd} (env workspaceFolder may be unexpanded)`,
+  );
   return resolvedWorkspace;
 }
 
 function currentWorkspace(): string {
-  return resolvedWorkspace ?? resolveWorkspaceFallback();
+  if (resolvedWorkspace) return resolvedWorkspace;
+  return envWorkspaceIfExplicit() ?? normalizeWorkspacePath(path.resolve(process.cwd()));
 }
 
 function resolveProjectName(workspace: string, override?: string): string {
@@ -151,6 +186,12 @@ function resolveProjectName(workspace: string, override?: string): string {
 }
 
 async function ensureRegistered(nameOverride?: string): Promise<Project> {
+  // Always re-resolve: Open Folder / multi-window must not keep a stale path
+  try {
+    await refreshWorkspaceFromClient();
+  } catch {
+    /* keep previous */
+  }
   const workspace = normalizeWorkspacePath(currentWorkspace());
   const name = resolveProjectName(workspace, nameOverride);
 

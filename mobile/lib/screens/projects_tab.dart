@@ -19,7 +19,7 @@ class ProjectsTab extends StatelessWidget {
         return ListTile(
           selected: selected,
           title: Text(p.displayName),
-          subtitle: Text(p.workspacePath),
+          subtitle: Text('${p.ideLabel} · ${p.workspacePath}'),
           trailing: Text(p.online ? '在线' : '离线'),
           onTap: () => state.selectProject(p.id),
         );

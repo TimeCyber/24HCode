@@ -15,7 +15,7 @@ class ContextTab extends StatelessWidget {
         child: Padding(
           padding: EdgeInsets.all(24),
           child: Text(
-            '暂无会话上下文。\nCursor / Codex 调用 sync_session_context 后会显示在这里。',
+            '暂无会话上下文。\nPC 侧 AI 工具调用 sync_session_context 后会显示在这里。',
             textAlign: TextAlign.center,
           ),
         ),

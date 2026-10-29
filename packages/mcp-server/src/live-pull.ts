@@ -1,9 +1,53 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { WebSocket } from "ws";
 import type { PromptDelivery } from "@codeassist/shared";
 import type { ApiClient } from "./api-client.js";
+
+/**
+ * 空闲超时：stdout/stderr 持续无输出才视为卡住（默认 5 分钟）。
+ * 正常长时间执行会不断有输出，定时器会被刷新，不会误杀。
+ */
+const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+/** 绝对上限：再活跃也最多跑这么久（默认 45 分钟），防真正失控 */
+const DEFAULT_MAX_TIMEOUT_MS = 45 * 60 * 1000;
+
+function envMs(name: string, fallback: number, minMs: number): number {
+  const n = Number(process.env[name] || fallback);
+  return Number.isFinite(n) && n >= minMs ? n : fallback;
+}
+
+function agentIdleTimeoutMs(): number {
+  return envMs("CODEASSIST_AGENT_IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT_MS, 30_000);
+}
+
+function agentMaxTimeoutMs(): number {
+  // 兼容旧变量名 CODEASSIST_AGENT_TIMEOUT_MS 作为绝对上限
+  return envMs("CODEASSIST_AGENT_TIMEOUT_MS", DEFAULT_MAX_TIMEOUT_MS, 60_000);
+}
+
+function killProcessTree(child: ChildProcess) {
+  const pid = child.pid;
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+        detached: true,
+      }).unref();
+    } else {
+      child.kill("SIGKILL");
+    }
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* ignore */
+    }
+  }
+}
 
 type Options = {
   serverUrl: string;
@@ -158,12 +202,57 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
           );
         }
 
-        const agentResult = await runCursorAgent(
-          opts.getWorkspace(),
-          enrichedContents,
-          prompts.map((p) => p.id),
-          resumeChatId,
-        );
+        // 空闲超时 + 绝对上限；有输出会续命。硬兜底防止 Windows 杀不干净导致队列永久卡住
+        const idleMs = agentIdleTimeoutMs();
+        const maxMs = agentMaxTimeoutMs();
+        let agentResult: AgentRunResult;
+        let hardTimer: ReturnType<typeof setTimeout> | undefined;
+        let lastHeartbeatAt = 0;
+        const heartbeat = () => {
+          const now = Date.now();
+          if (now - lastHeartbeatAt < 60_000) return;
+          lastHeartbeatAt = now;
+          for (const p of prompts) {
+            void api.ackPrompt(p.id).catch(() => undefined);
+          }
+          void api
+            .syncSessionContext({
+              projectId,
+              chatSessionId,
+              summary: `手机指令执行中（仍有进度）：${prompts.map((p) => p.content).join(" | ").slice(0, 160)}`,
+              currentStep: "Cursor Agent 执行中（活跃）",
+              openFiles: [],
+              status: "coding",
+            })
+            .catch(() => undefined);
+        };
+        try {
+          agentResult = await Promise.race([
+            runCursorAgent(
+              opts.getWorkspace(),
+              enrichedContents,
+              prompts.map((p) => p.id),
+              resumeChatId,
+              idleMs,
+              maxMs,
+              heartbeat,
+            ).finally(() => {
+              if (hardTimer) clearTimeout(hardTimer);
+            }),
+            new Promise<AgentRunResult>((resolve) => {
+              hardTimer = setTimeout(() => {
+                resolve({
+                  text: `[agent-error] 执行超过绝对上限(${Math.round(maxMs / 1000)}s)，已中止以免阻塞后续手机指令`,
+                });
+              }, maxMs + 20_000);
+            }),
+          ]);
+        } catch (err) {
+          if (hardTimer) clearTimeout(hardTimer);
+          agentResult = {
+            text: `[agent-error] ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
 
         if (chatSessionId && agentResult.cursorChatId) {
           await api
@@ -418,6 +507,9 @@ function runCursorAgent(
   contents: string[],
   deliveryIds: string[],
   resumeChatId?: string,
+  idleTimeoutMs: number = agentIdleTimeoutMs(),
+  maxTimeoutMs: number = agentMaxTimeoutMs(),
+  onActivity?: () => void,
 ): Promise<AgentRunResult> {
   return new Promise((resolve) => {
     const launch = resolveAgentLaunch();
@@ -469,19 +561,29 @@ function runCursorAgent(
     }
     args.push(promptArg);
 
-    const timeoutMs = Number(
-      process.env.CODEASSIST_AGENT_TIMEOUT_MS || 15 * 60 * 1000,
-    );
-
     console.error(
-      `[codeassist-mcp] Cursor Agent 执行中(无黑框): ${launch.label}`,
+      `[codeassist-mcp] Cursor Agent 执行中(无黑框, idle=${Math.round(idleTimeoutMs / 1000)}s, max=${Math.round(maxTimeoutMs / 1000)}s): ${launch.label}`,
     );
     let out = "";
     let err = "";
     let settled = false;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let maxTimer: ReturnType<typeof setTimeout> | undefined;
+    let killWaitTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearTimers = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (maxTimer) clearTimeout(maxTimer);
+      if (killWaitTimer) clearTimeout(killWaitTimer);
+      idleTimer = undefined;
+      maxTimer = undefined;
+      killWaitTimer = undefined;
+    };
+
     const finish = (text: string, cursorChatId?: string) => {
       if (settled) return;
       settled = true;
+      clearTimers();
       if (promptFile) {
         try {
           fs.unlinkSync(promptFile);
@@ -504,31 +606,57 @@ function runCursorAgent(
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const timer = setTimeout(() => {
+    const abortForTimeout = (reason: string) => {
+      if (settled) return;
+      console.error(`[codeassist-mcp] Agent ${reason}，taskkill 进程树`);
+      killProcessTree(child);
+      killWaitTimer = setTimeout(() => {
+        if (settled) return;
+        killProcessTree(child);
+        const partial = [out, err].filter(Boolean).join("\n").trim();
+        finish(
+          `[agent-error] ${reason}，已中止以免阻塞后续手机指令\n${partial || "(无输出)"}`,
+          extractCursorChatId(partial),
+        );
+      }, 8_000);
+    };
+
+    const armIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        abortForTimeout(
+          `空闲超时(${Math.round(idleTimeoutMs / 1000)}s无输出)`,
+        );
+      }, idleTimeoutMs);
+    };
+
+    armIdleTimer();
+    maxTimer = setTimeout(() => {
+      abortForTimeout(`绝对上限(${Math.round(maxTimeoutMs / 1000)}s)`);
+    }, maxTimeoutMs);
+
+    const noteActivity = () => {
+      if (settled) return;
+      armIdleTimer();
       try {
-        child.kill();
+        onActivity?.();
       } catch {
         /* ignore */
       }
-      const partial = [out, err].filter(Boolean).join("\n").trim();
-      finish(
-        `[agent-error] 执行超时(${Math.round(timeoutMs / 1000)}s)\n${partial || "(无输出)"}`,
-        extractCursorChatId(partial),
-      );
-    }, timeoutMs);
+    };
 
     child.stdout?.on("data", (d: Buffer) => {
       out += d.toString("utf8");
+      noteActivity();
     });
     child.stderr?.on("data", (d: Buffer) => {
       err += d.toString("utf8");
+      noteActivity();
     });
     child.on("error", (e) => {
-      clearTimeout(timer);
       finish(`[agent-error] ${e.message}`);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
       const raw = [out, err].filter(Boolean).join("\n").trim();
       const cursorChatId = extractCursorChatId(raw) ?? resumeChatId;
       if (code !== 0 && !raw) {

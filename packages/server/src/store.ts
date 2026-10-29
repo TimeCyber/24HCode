@@ -700,6 +700,28 @@ export class Store {
     return this.getDelivery(deliveryId);
   }
 
+  /** 清理长时间卡在 running/delivered 的指令，避免手机一直转圈且后续指令排不上 */
+  failStalePromptDeliveries(
+    maxAgeMs: number,
+    resultMessage: string,
+  ): PromptDelivery[] {
+    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM prompt_deliveries
+         WHERE status IN ('running', 'delivered') AND updated_at < ?
+         ORDER BY updated_at ASC
+         LIMIT 50`,
+      )
+      .all(cutoff) as Array<{ id: string }>;
+    const out: PromptDelivery[] = [];
+    for (const row of rows) {
+      const d = this.completePrompt(row.id, "failed", resultMessage);
+      if (d) out.push(d);
+    }
+    return out;
+  }
+
   getDelivery(id: string): PromptDelivery | null {
     const row = this.db
       .prepare(

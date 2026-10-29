@@ -138,7 +138,7 @@ class _ProjectSheet extends StatelessWidget {
                     children: [
                       Expanded(
                         child: Text(
-                          '连接 / 选择 Cursor 项目',
+                          '连接 / 选择 AI 项目',
                           style: Theme.of(context).textTheme.titleMedium,
                         ),
                       ),
@@ -151,7 +151,9 @@ class _ProjectSheet extends StatelessWidget {
                 ),
                 Expanded(
                   child: s.projects.isEmpty
-                      ? const Center(child: Text('暂无项目，请先在 PC 打开 Cursor'))
+                      ? const Center(
+                          child: Text('暂无项目，请先在 PC 打开 AI 工具并启用 MCP'),
+                        )
                       : ListView.separated(
                           itemCount: s.projects.length,
                           separatorBuilder: (_, __) => const Divider(height: 1),
@@ -167,7 +169,7 @@ class _ProjectSheet extends StatelessWidget {
                               ),
                               title: Text(p.displayName),
                               subtitle: Text(
-                                '${p.online ? '在线' : '离线'} · ${p.workspacePath}',
+                                '${p.online ? '在线' : '离线'} · ${p.ideLabel} · ${p.workspacePath}',
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                               ),

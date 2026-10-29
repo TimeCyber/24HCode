@@ -34,7 +34,7 @@ class BackgroundWatchService {
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'codeassist_watch',
         channelName: '任务监听',
-        channelDescription: '应用在后台时监听 Cursor 任务完成',
+        channelDescription: '应用在后台时监听 AI 任务完成',
         onlyAlertOnce: true,
       ),
       iosNotificationOptions: const IOSNotificationOptions(
@@ -107,11 +107,9 @@ class BackgroundWatchService {
       return;
     }
 
+    // 安卓 10 只声明 dataSync；remoteMessaging 为 API34+，部分机型组合声明会起服失败
     await FlutterForegroundTask.startService(
-      serviceTypes: const [
-        ForegroundServiceTypes.dataSync,
-        ForegroundServiceTypes.remoteMessaging,
-      ],
+      serviceTypes: const [ForegroundServiceTypes.dataSync],
       notificationTitle: 'CodeAssist 正在等待任务完成',
       notificationText: '可切到后台，完成后会推送通知',
       callback: codeAssistStartCallback,
@@ -228,8 +226,6 @@ class CodeAssistWatchHandler extends TaskHandler {
           continue;
         }
 
-        notified.add(id);
-        if (watching.remove(id)) watchingChanged = true;
         final ok = status != 'failed';
         final content = (raw['content'] as String?)?.trim() ?? '';
         final preview = (result != null && result.isNotEmpty)
@@ -241,13 +237,16 @@ class CodeAssistWatchHandler extends TaskHandler {
 
         try {
           await NotificationService.instance.showTaskCompleted(
-            title: ok ? 'Cursor 任务完成' : 'Cursor 任务失败',
+            title: ok ? '任务完成' : '任务失败',
             body: body,
           );
-          // 同步把常驻通知改成完成提示，避免用户完全看不到
+          // 成功后才写入 notified，失败下一轮还能重试
+          notified.add(id);
+          if (watching.remove(id)) watchingChanged = true;
           await FlutterForegroundTask.updateService(
-            notificationTitle: ok ? 'Cursor 任务完成' : 'Cursor 任务失败',
-            notificationText: body.length > 60 ? '${body.substring(0, 60)}…' : body,
+            notificationTitle: ok ? '任务完成' : '任务失败',
+            notificationText:
+                body.length > 60 ? '${body.substring(0, 60)}…' : body,
           );
           didNotify = true;
         } catch (e) {
@@ -272,11 +271,19 @@ class CodeAssistWatchHandler extends TaskHandler {
       }
 
       if (!hasInFlight) {
-        if (didNotify) {
-          await Future<void>.delayed(const Duration(milliseconds: 1200));
+        if (didNotify || watching.isEmpty) {
+          if (didNotify) {
+            await Future<void>.delayed(const Duration(milliseconds: 1200));
+          }
+          FlutterForegroundTask.sendDataToMain({'action': 'stop_watch'});
+          await FlutterForegroundTask.stopService();
+        } else {
+          // 已终态但弹通知失败：保留服务下一轮重试（安卓 10 常见）
+          await FlutterForegroundTask.updateService(
+            notificationTitle: '任务已完成，正在重试通知',
+            notificationText: '若一直无横幅，请检查系统通知权限',
+          );
         }
-        FlutterForegroundTask.sendDataToMain({'action': 'stop_watch'});
-        await FlutterForegroundTask.stopService();
       } else {
         await FlutterForegroundTask.updateService(
           notificationTitle: 'CodeAssist 正在等待任务完成',

@@ -1,3 +1,5 @@
+import 'ide_labels.dart';
+
 class Project {
   Project({
     required this.id,
@@ -14,6 +16,9 @@ class Project {
   final String ide;
   final String lastSeenAt;
   final bool online;
+
+  /// UI 展示用：Cursor / Codex / Trae / WorkBuddy …
+  String get ideLabel => ideDisplayName(ide);
 
   factory Project.fromJson(Map<String, dynamic> json) => Project(
         id: json['id'] as String,

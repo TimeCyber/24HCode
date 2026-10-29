@@ -1,6 +1,14 @@
 import { z } from "zod";
 
-export const IdeSchema = z.enum(["cursor", "codex"]);
+export const IdeSchema = z.enum([
+  "cursor",
+  "codex",
+  "trae",
+  "trea",
+  "workbuddy",
+  "claude",
+  "claude-code",
+]);
 export type Ide = z.infer<typeof IdeSchema>;
 
 export const ProjectSchema = z.object({

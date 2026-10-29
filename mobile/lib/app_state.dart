@@ -8,6 +8,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'api_client.dart';
 import 'background_watch_service.dart';
+import 'ide_labels.dart';
 import 'models.dart';
 import 'notification_service.dart';
 
@@ -205,7 +206,7 @@ class AppState extends ChangeNotifier {
     final api = _api;
     final projectId = activeProjectId;
     if (api == null || projectId == null) {
-      throw Exception('请先选择 Cursor 项目');
+      throw Exception('请先选择 AI 项目');
     }
     await api.deleteChatSession(sessionId);
     chatSessions = _dedupeSessions(
@@ -267,28 +268,46 @@ class AppState extends ChangeNotifier {
     if (old == null) return;
     if (_looksCompleted(old)) return;
     if (_completionSoundPlayed.contains(next.id)) return;
-    // 后台交给前台服务推送，避免主线程抢先标记 notified / 停服务导致无推送
+    // 主线程也推：安卓 10 上进程还活着时比只靠 FGS 更稳；与 FGS 用同一 notified 列表去重
     unawaited(() async {
-      final inFg = await BackgroundWatchService.isAppForeground();
-      if (!inFg) return;
       if (_completionSoundPlayed.contains(next.id)) return;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload();
+      final already = prefs.getStringList(_kBgNotifiedIds) ?? [];
+      if (already.contains(next.id)) {
+        _completionSoundPlayed.add(next.id);
+        return;
+      }
+
       _completionSoundPlayed.add(next.id);
-      await _rememberNotifiedPrompt(next.id);
-      _playCompletionSound();
       final ok = next.status != 'failed';
       final preview = (next.result ?? next.content).trim();
       final body = preview.isEmpty
           ? (ok ? '指令已完成' : '指令执行失败')
           : (preview.length > 120 ? '${preview.substring(0, 120)}…' : preview);
-      await NotificationService.instance.showTaskCompleted(
-        title: ok ? 'Cursor 任务完成' : 'Cursor 任务失败',
-        body: body,
-      );
-      await BackgroundWatchService.ensureWatching(
-        hasInFlight: _hasInFlightMessages,
-      );
+      try {
+        _playCompletionSound();
+        await NotificationService.instance.showTaskCompleted(
+          title: ok ? '${_activeIdeLabel()} 任务完成' : '${_activeIdeLabel()} 任务失败',
+          body: body,
+        );
+        await _rememberNotifiedPrompt(next.id);
+      } catch (_) {
+        // 失败允许重试 / 交给前台服务再推
+        _completionSoundPlayed.remove(next.id);
+      }
+      // 仅前台时停监听服务；后台留给 FGS 自己停，避免抢停导致漏推
+      final inFg = await BackgroundWatchService.isAppForeground();
+      if (inFg) {
+        await BackgroundWatchService.ensureWatching(
+          hasInFlight: _hasInFlightMessages,
+        );
+      }
     }());
   }
+
+  String _activeIdeLabel() =>
+      activeProject?.ideLabel ?? kGenericIdeLabel;
 
   void _maybeNotifyTaskEvent(TaskEvent? old, TaskEvent next) {
     final completed = next.type == 'completed' || next.status == 'completed';
@@ -306,7 +325,7 @@ class AppState extends ChangeNotifier {
         : '${next.title}\n${detail.length > 100 ? '${detail.substring(0, 100)}…' : detail}';
     unawaited(
       NotificationService.instance.showTaskCompleted(
-        title: 'Cursor 任务完成',
+        title: '${_activeIdeLabel()} 任务完成',
         body: body,
       ),
     );
@@ -356,7 +375,7 @@ class AppState extends ChangeNotifier {
     final api = _api;
     final projectId = activeProjectId;
     if (api == null || projectId == null) {
-      throw Exception('请先选择 Cursor 项目');
+      throw Exception('请先选择 AI 项目');
     }
     final session = await api.createChatSession(
       projectId,
@@ -390,7 +409,7 @@ class AppState extends ChangeNotifier {
     final projectId = activeProjectId;
     var chatSessionId = activeChatSessionId;
     if (projectId == null) {
-      throw Exception('请先在右上角选择 Cursor 项目');
+      throw Exception('请先在右上角选择 AI 项目');
     }
     if (chatSessionId == null) {
       await addChatSession(title: '默认会话');
@@ -422,7 +441,7 @@ class AppState extends ChangeNotifier {
     final projectId = activeProjectId;
     var chatSessionId = activeChatSessionId;
     if (api == null) throw Exception('未连接服务器');
-    if (projectId == null) throw Exception('请先在右上角选择 Cursor 项目');
+    if (projectId == null) throw Exception('请先在右上角选择 AI 项目');
     if (chatSessionId == null) {
       await addChatSession(title: '默认会话');
       chatSessionId = activeChatSessionId;
