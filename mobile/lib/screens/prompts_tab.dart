@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -146,11 +145,13 @@ class _PromptsTabState extends State<PromptsTab> {
                                     Icons.circle,
                                     size: 12,
                                     color:
-                                        p.online ? Colors.green : Colors.grey,
+                                        p.isEffectivelyOnline()
+                                            ? Colors.green
+                                            : Colors.grey,
                                   ),
                                   title: Text(p.displayName),
                                   subtitle: Text(
-                                    '${p.online ? '在线' : '离线'} · ${p.ideLabel} · ${p.workspacePath}',
+                                    '${p.isEffectivelyOnline() ? '在线' : '离线'} · ${p.ideLabel} · ${p.workspacePath}',
                                     maxLines: 2,
                                     overflow: TextOverflow.ellipsis,
                                   ),
@@ -418,6 +419,7 @@ class _PromptsTabState extends State<PromptsTab> {
                       itemBuilder: (context, index) {
                         final m = messages[messages.length - 1 - index];
                         return _MessageBubble(
+                          key: ValueKey(m.id),
                           message: m,
                           statusHint: _statusHint(m),
                         );
@@ -616,15 +618,15 @@ class _ComposerBarState extends State<_ComposerBar> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final enabled = widget.enabled;
+    // 给系统底部手势条留出空间，避免输入栏盖住 Home 上滑区域
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     return Material(
       elevation: 6,
       shadowColor: Colors.black26,
       color: scheme.surface,
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
-          child: Row(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(10, 10, 10, 10 + bottomInset),
+        child: Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               IconButton.filledTonal(
@@ -730,13 +732,13 @@ class _ComposerBarState extends State<_ComposerBar> {
             ],
           ),
         ),
-      ),
     );
   }
 }
 
-class _MessageBubble extends StatelessWidget {
+class _MessageBubble extends StatefulWidget {
   const _MessageBubble({
+    super.key,
     required this.message,
     required this.statusHint,
   });
@@ -745,7 +747,19 @@ class _MessageBubble extends StatelessWidget {
   final String statusHint;
 
   @override
+  State<_MessageBubble> createState() => _MessageBubbleState();
+}
+
+class _MessageBubbleState extends State<_MessageBubble>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => widget.message.attachment != null;
+
+  @override
   Widget build(BuildContext context) {
+    super.build(context);
+    final message = widget.message;
+    final statusHint = widget.statusHint;
     final scheme = Theme.of(context).colorScheme;
     final hasResult =
         message.result != null && message.result!.trim().isNotEmpty;
@@ -859,18 +873,10 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
-class _FileDownloadButton extends StatefulWidget {
+class _FileDownloadButton extends StatelessWidget {
   const _FileDownloadButton({required this.attachment});
 
   final FileAttachment attachment;
-
-  @override
-  State<_FileDownloadButton> createState() => _FileDownloadButtonState();
-}
-
-class _FileDownloadButtonState extends State<_FileDownloadButton> {
-  bool _busy = false;
-  String? _savedPath;
 
   String _mimeForPath(String path) {
     final lower = path.toLowerCase();
@@ -882,22 +888,24 @@ class _FileDownloadButtonState extends State<_FileDownloadButton> {
     if (lower.endsWith('.gif')) return 'image/gif';
     if (lower.endsWith('.webp')) return 'image/webp';
     if (lower.endsWith('.pdf')) return 'application/pdf';
-    if (lower.endsWith('.txt') || lower.endsWith('.log') || lower.endsWith('.md')) {
+    if (lower.endsWith('.txt') ||
+        lower.endsWith('.log') ||
+        lower.endsWith('.md')) {
       return 'text/plain';
     }
     if (lower.endsWith('.zip')) return 'application/zip';
     if (lower.endsWith('.json')) return 'application/json';
-    return widget.attachment.mimeType?.trim().isNotEmpty == true
-        ? widget.attachment.mimeType!.trim()
+    return attachment.mimeType?.trim().isNotEmpty == true
+        ? attachment.mimeType!.trim()
         : '*/*';
   }
 
-  Future<void> _ensureCanInstallApk() async {
+  Future<void> _ensureCanInstallApk(BuildContext context) async {
     if (!Platform.isAndroid) return;
     final status = await Permission.requestInstallPackages.status;
     if (status.isGranted) return;
     final req = await Permission.requestInstallPackages.request();
-    if (!req.isGranted && mounted) {
+    if (!req.isGranted && context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('请允许「安装未知应用」后再打开 APK')),
       );
@@ -905,11 +913,9 @@ class _FileDownloadButtonState extends State<_FileDownloadButton> {
     }
   }
 
-  Future<void> _openSaved() async {
-    final path = _savedPath;
-    if (path == null || path.isEmpty) return;
+  Future<void> _openSaved(BuildContext context, String path) async {
     if (!await File(path).exists()) {
-      if (!mounted) return;
+      if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('文件不存在，请重新下载')),
       );
@@ -918,82 +924,56 @@ class _FileDownloadButtonState extends State<_FileDownloadButton> {
 
     final mime = _mimeForPath(path);
     if (path.toLowerCase().endsWith('.apk')) {
-      await _ensureCanInstallApk();
+      await _ensureCanInstallApk(context);
     }
 
     final result = await OpenFilex.open(path, type: mime);
-    if (!mounted) return;
+    if (!context.mounted) return;
     if (result.type == ResultType.done) return;
 
-    // 系统无法直接打开时，走分享面板（可选文件管理器/安装器）
     try {
       await SharePlus.instance.share(
         ShareParams(
           files: [XFile(path, mimeType: mime)],
-          text: widget.attachment.fileName,
+          text: attachment.fileName,
         ),
       );
     } catch (e) {
-      if (!mounted) return;
+      if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('无法打开：${result.message}；$e')),
       );
     }
   }
 
-  Future<Directory> _resolveSaveDir() async {
-    if (Platform.isAndroid) {
-      final ext = await getExternalStorageDirectory();
-      if (ext != null) {
-        final d = Directory('${ext.path}/CodeAssistDownloads');
-        if (!await d.exists()) await d.create(recursive: true);
-        return d;
-      }
-    }
-    final docs = await getApplicationDocumentsDirectory();
-    final d = Directory('${docs.path}/CodeAssistDownloads');
-    if (!await d.exists()) await d.create(recursive: true);
-    return d;
-  }
-
-  Future<void> _shareSaved() async {
-    final path = _savedPath;
-    if (path == null || path.isEmpty) return;
+  Future<void> _shareSaved(String path) async {
     final mime = _mimeForPath(path);
     await SharePlus.instance.share(
       ShareParams(
         files: [XFile(path, mimeType: mime)],
-        text: widget.attachment.fileName,
+        text: attachment.fileName,
       ),
     );
   }
 
-  Future<void> _copyPath() async {
-    final path = _savedPath;
-    if (path == null || path.isEmpty) return;
+  Future<void> _copyPath(BuildContext context, String path) async {
     await Clipboard.setData(ClipboardData(text: path));
-    if (!mounted) return;
+    if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('路径已复制')),
     );
   }
 
-  Future<void> _download() async {
+  Future<void> _download(BuildContext context) async {
     final state = context.read<AppState>();
-    setState(() => _busy = true);
-    try {
-      final bytes =
-          await state.downloadAttachmentBytes(widget.attachment.id);
-      final saveDir = await _resolveSaveDir();
-      final safeName = widget.attachment.fileName
-          .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
-      final file = File('${saveDir.path}/$safeName');
-      await file.writeAsBytes(bytes, flush: true);
-      if (!mounted) return;
-      setState(() => _savedPath = file.path);
-      // 短提示自动消失；完整路径与「打开」已在下方按钮区展示，避免挡住输入框
-      final messenger = ScaffoldMessenger.of(context);
-      messenger.clearSnackBars();
+    final result = await state.downloadAttachmentFile(
+      fileId: attachment.id,
+      fileName: attachment.fileName,
+    );
+    if (!context.mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    if (result.status == AttachmentDownloadStatus.done) {
       messenger.showSnackBar(
         const SnackBar(
           content: Text('下载完成'),
@@ -1002,37 +982,37 @@ class _FileDownloadButtonState extends State<_FileDownloadButton> {
           margin: EdgeInsets.only(left: 12, right: 12, bottom: 88),
         ),
       );
-    } catch (e) {
-      if (!mounted) return;
-      final messenger = ScaffoldMessenger.of(context);
-      messenger.clearSnackBars();
+    } else if (result.status == AttachmentDownloadStatus.failed) {
       messenger.showSnackBar(
         SnackBar(
-          content: Text('下载失败：$e'),
+          content: Text('下载失败：${result.error ?? ""}'),
           duration: const Duration(seconds: 3),
           behavior: SnackBarBehavior.floating,
           margin: const EdgeInsets.only(left: 12, right: 12, bottom: 88),
         ),
       );
-    } finally {
-      if (mounted) setState(() => _busy = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final size = widget.attachment.size;
+    final dl = context.select<AppState, AttachmentDownloadState?>(
+      (s) => s.attachmentDownloadOf(attachment.id),
+    );
+    final busy = dl?.isBusy == true;
+    final savedPath = dl?.savedPath;
+    final size = attachment.size;
     final sizeLabel = size >= 1024 * 1024
         ? '${(size / (1024 * 1024)).toStringAsFixed(1)} MB'
         : '${(size / 1024).ceil()} KB';
     final scheme = Theme.of(context).colorScheme;
-    final isApk = widget.attachment.fileName.toLowerCase().endsWith('.apk');
+    final isApk = attachment.fileName.toLowerCase().endsWith('.apk');
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         FilledButton.tonalIcon(
-          onPressed: _busy ? null : _download,
-          icon: _busy
+          onPressed: busy ? null : () => _download(context),
+          icon: busy
               ? const SizedBox(
                   width: 16,
                   height: 16,
@@ -1040,21 +1020,23 @@ class _FileDownloadButtonState extends State<_FileDownloadButton> {
                 )
               : const Icon(Icons.download),
           label: Text(
-            _savedPath == null
-                ? '下载 ${widget.attachment.fileName}（$sizeLabel）'
-                : '重新下载 ${widget.attachment.fileName}',
+            busy
+                ? '下载中 ${attachment.fileName}…'
+                : (savedPath == null
+                    ? '下载 ${attachment.fileName}（$sizeLabel）'
+                    : '重新下载 ${attachment.fileName}'),
           ),
         ),
-        if (_savedPath != null) ...[
+        if (savedPath != null) ...[
           const SizedBox(height: 8),
           FilledButton.icon(
-            onPressed: _openSaved,
+            onPressed: () => _openSaved(context, savedPath),
             icon: Icon(isApk ? Icons.android : Icons.open_in_new),
             label: Text(isApk ? '打开 / 安装 APK' : '打开已下载文件'),
           ),
           const SizedBox(height: 6),
           OutlinedButton.icon(
-            onPressed: _shareSaved,
+            onPressed: () => _shareSaved(savedPath),
             icon: const Icon(Icons.share_outlined),
             label: const Text('分享到其他应用打开'),
           ),
@@ -1064,8 +1046,8 @@ class _FileDownloadButtonState extends State<_FileDownloadButton> {
             borderRadius: BorderRadius.circular(10),
             child: InkWell(
               borderRadius: BorderRadius.circular(10),
-              onTap: _openSaved,
-              onLongPress: _copyPath,
+              onTap: () => _openSaved(context, savedPath),
+              onLongPress: () => _copyPath(context, savedPath),
               child: Padding(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -1076,7 +1058,7 @@ class _FileDownloadButtonState extends State<_FileDownloadButton> {
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
-                        _savedPath!,
+                        savedPath,
                         style: Theme.of(context).textTheme.labelSmall?.copyWith(
                               color: scheme.primary,
                               decoration: TextDecoration.underline,

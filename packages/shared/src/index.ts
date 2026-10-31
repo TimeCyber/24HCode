@@ -248,12 +248,34 @@ export type SyncSessionContextRequest = z.infer<
   typeof SyncSessionContextRequestSchema
 >;
 
+export const OpenWorkspaceRequestSchema = z.object({
+  workspacePath: z.string().min(1),
+  ide: IdeSchema.default("cursor"),
+  /** 指定由哪个已在线项目的 MCP/桥接执行；不传则任意匹配 IDE 的在线节点可认领 */
+  viaProjectId: z.string().min(1).optional(),
+});
+export type OpenWorkspaceRequest = z.infer<typeof OpenWorkspaceRequestSchema>;
+
+export const OpenWorkspaceCommandSchema = z.object({
+  id: z.string(),
+  workspacePath: z.string(),
+  ide: IdeSchema,
+  viaProjectId: z.string().optional(),
+  status: z.enum(["queued", "claimed", "done", "failed"]),
+  claimedBy: z.string().optional(),
+  error: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type OpenWorkspaceCommand = z.infer<typeof OpenWorkspaceCommandSchema>;
+
 export const WsEventTypeSchema = z.enum([
   "task.created",
   "task.updated",
   "prompt.updated",
   "project.online",
   "project.offline",
+  "project.open",
   "decision.created",
   "session.updated",
   "chat.session.updated",

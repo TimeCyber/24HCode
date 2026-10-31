@@ -12,6 +12,8 @@ import {
   type DecisionAction,
   type FileTransfer,
   type Ide,
+  type OpenWorkspaceCommand,
+  type OpenWorkspaceRequest,
   type Project,
   type PromptDelivery,
   type PromptJob,
@@ -53,7 +55,66 @@ function projectIdFrom(workspacePath: string, ide: Ide, explicitId?: string): st
 }
 
 export class Store {
+  /** 手机 → PC 打开工作区：内存队列（认领后由 MCP/桥接执行） */
+  private openWorkspaceCommands: OpenWorkspaceCommand[] = [];
+
   constructor(private readonly db: Db) {}
+
+  enqueueOpenWorkspace(input: OpenWorkspaceRequest): OpenWorkspaceCommand {
+    const now = nowIso();
+    const cmd: OpenWorkspaceCommand = {
+      id: nanoid(),
+      workspacePath: input.workspacePath.trim(),
+      ide: input.ide,
+      viaProjectId: input.viaProjectId,
+      status: "queued",
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.openWorkspaceCommands.unshift(cmd);
+    // 只保留最近 50 条
+    if (this.openWorkspaceCommands.length > 50) {
+      this.openWorkspaceCommands.length = 50;
+    }
+    return cmd;
+  }
+
+  /**
+   * 在线 MCP/桥接认领打开任务。
+   * 匹配：queued，且 viaProjectId 为空或等于本 projectId；ide 与本项目一致（若能查到项目）。
+   */
+  claimOpenWorkspace(projectId: string): OpenWorkspaceCommand | null {
+    const project = this.getProject(projectId);
+    const now = nowIso();
+    for (const cmd of this.openWorkspaceCommands) {
+      if (cmd.status !== "queued") continue;
+      if (cmd.viaProjectId && cmd.viaProjectId !== projectId) continue;
+      if (project && cmd.ide !== project.ide) continue;
+      cmd.status = "claimed";
+      cmd.claimedBy = projectId;
+      cmd.updatedAt = now;
+      return { ...cmd };
+    }
+    return null;
+  }
+
+  completeOpenWorkspace(
+    id: string,
+    status: "done" | "failed",
+    error?: string,
+  ): OpenWorkspaceCommand | null {
+    const cmd = this.openWorkspaceCommands.find((c) => c.id === id);
+    if (!cmd) return null;
+    cmd.status = status;
+    cmd.error = error;
+    cmd.updatedAt = nowIso();
+    return { ...cmd };
+  }
+
+  getOpenWorkspace(id: string): OpenWorkspaceCommand | null {
+    const cmd = this.openWorkspaceCommands.find((c) => c.id === id);
+    return cmd ? { ...cmd } : null;
+  }
 
   registerProject(input: RegisterProjectRequest): Project {
     const id = projectIdFrom(input.workspacePath, input.ide, input.id);
@@ -1054,6 +1115,14 @@ export class Store {
       )
       .all() as Array<Record<string, unknown>>;
     return rows.map(mapSession);
+  }
+
+  /** 找一个指定 IDE 的在线项目，供打开工作区时默认经由 */
+  findOnlineProjectForIde(ide: Ide): Project | null {
+    const list = this.listProjects().filter(
+      (p) => p.ide === ide && p.online,
+    );
+    return list[0] ?? null;
   }
 }
 

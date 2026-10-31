@@ -4,6 +4,7 @@ import type {
   CreateTaskRequest,
   Decision,
   FileTransfer,
+  OpenWorkspaceCommand,
   Project,
   PromptDelivery,
   PromptJob,
@@ -124,5 +125,23 @@ export class ApiClient {
     }
     const ab = await res.arrayBuffer();
     return Buffer.from(ab);
+  }
+
+  claimOpenWorkspace(projectId: string): Promise<OpenWorkspaceCommand[]> {
+    return this.request(
+      "GET",
+      `/api/mcp/open-workspace?projectId=${encodeURIComponent(projectId)}`,
+    );
+  }
+
+  completeOpenWorkspace(
+    id: string,
+    status: "done" | "failed" = "done",
+    error?: string,
+  ): Promise<OpenWorkspaceCommand> {
+    return this.request("POST", `/api/mcp/open-workspace/${id}/complete`, {
+      status,
+      error,
+    });
   }
 }

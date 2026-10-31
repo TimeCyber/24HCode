@@ -16,14 +16,31 @@
 
 手机发指令时，MCP live-pull 也会自动拉起 `codex exec`；规则里仍要求每轮主动 `get_pending_prompts`。
 
-## 保持 Codex 项目在线
+## 保持项目在线 / 开机自启
 
-仅「写进 Codex MCP 配置」不够：必须有进程持续 heartbeat。推荐二选一：
+仅「写进 Cursor/Codex MCP 配置」不够：必须有进程持续 heartbeat。
 
-1. **独立桥接（推荐，不依赖桌面是否加载 MCP）**  
-   双击或后台运行：`packages/mcp-server/start-codex-bridge.bat`  
-   （中继需已启动；日志：`packages/mcp-server/codex-bridge.log`）
-2. **Codex 桌面已加载 MCP**  
-   添加 MCP 后需**重启 Codex**，并打开本仓库工作区，才会持续在线。
+### 开机自动连中继（推荐）
 
-若手机一直「等待」后变离线，几乎都是桥接/MCP 没在跑。
+登录 Windows 后自动起 **中继 :8787 + Cursor bridge**，不用每次跟 Agent 说启动：
+
+```bat
+REM 注册登录自启（执行一次即可）
+powershell -ExecutionPolicy Bypass -File D:\androidproject\CodeAssit\scripts\install-autostart.ps1
+
+REM 手动立刻启动
+D:\androidproject\CodeAssit\start-codeassist-all.bat
+```
+
+- 计划任务名：`CodeAssist Autostart`  
+- 日志：`packages/mcp-server/start-all.log`、`relay-server.log`、`cursor-bridge.log`  
+- 卸载：`scripts\uninstall-autostart.ps1`
+
+### 手动 / Codex
+
+1. **独立桥接（不依赖桌面是否加载 MCP）**  
+   `packages/mcp-server/start-codex-bridge.bat`（中继需已启动）  
+2. **IDE 已加载 MCP**  
+   打开本仓库工作区后才会持续在线。
+
+若手机一直「等待」后变离线，几乎都是桥接/MCP/中继没在跑。

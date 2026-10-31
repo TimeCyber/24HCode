@@ -118,6 +118,29 @@ Token: same as `ACCESS_TOKEN` (default `codeassist-dev-token`).
 | `DATA_DIR` | `./data` | SQLite directory |
 | `OFFLINE_MS` | `120000` | Offline threshold |
 
+### Autostart on Windows logon (optional)
+
+To start the relay + Cursor bridge automatically after login (so you don’t have to ask the Agent to “start” every reboot):
+
+```powershell
+cd <REPO>
+# Register once
+powershell -ExecutionPolicy Bypass -File .\scripts\install-autostart.ps1
+
+# Or start manually now
+.\start-codeassist-all.bat
+```
+
+- Task name: `CodeAssist Autostart`
+- Logs: `packages/mcp-server/start-all.log`, `relay-server.log`, `cursor-bridge.log`
+- Uninstall:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-autostart.ps1
+```
+
+Skip this section if you prefer starting the relay manually with `npm run start:server`.
+
 ---
 
 ## 3. Configure Cursor MCP

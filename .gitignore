@@ -6,6 +6,7 @@ packages/server/data/
 .codeassist/
 .env
 .env.local
+packages/mcp-server/.codeassist-device.env
 mobile/.dart_tool/
 mobile/.flutter-plugins-dependencies
 mobile/.packages

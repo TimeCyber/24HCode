@@ -4,6 +4,10 @@ import path from "node:path";
 import { WebSocket } from "ws";
 import type { PromptDelivery } from "@codeassist/shared";
 import type { ApiClient } from "./api-client.js";
+import {
+  openIdeWorkspace,
+  startBridgeForWorkspace,
+} from "./open-workspace.js";
 
 /**
  * 空闲超时：stdout/stderr 持续无输出才视为卡住（默认 5 分钟）。
@@ -81,14 +85,11 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
     ws.on("open", () => {
       console.error("[codeassist-mcp] live-pull connected (phone→PC→结果回传)");
       const projectId = opts.getProjectId();
-      ws?.send(
-        JSON.stringify({
-          type: "subscribe",
-          ...(projectId ? { projectIds: [projectId] } : {}),
-        }),
-      );
+      // 订阅全部事件：除本项目 prompt 外，还需收到 project.open
+      ws?.send(JSON.stringify({ type: "subscribe" }));
       // 重连后把积压的 queued 排空
       void drainQueue();
+      void drainOpenWorkspace();
     });
 
     ws.on("message", (raw) => {
@@ -119,8 +120,18 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
           projectId?: string;
           status?: string;
           content?: string;
+          workspacePath?: string;
+          viaProjectId?: string;
+          claimedBy?: string;
         };
       };
+      if (msg.type === "project.open" && msg.payload) {
+        const st = msg.payload.status;
+        if (!st || st === "queued") {
+          await drainOpenWorkspace();
+        }
+        return;
+      }
       if (msg.type !== "prompt.updated" || !msg.payload) return;
       const projectId = opts.getProjectId();
       if (!projectId || msg.payload.projectId !== projectId) return;
@@ -134,6 +145,48 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
       await drainQueue();
     } catch (err) {
       console.error("[codeassist-mcp] live-pull error:", err);
+    }
+  }
+
+  async function drainOpenWorkspace() {
+    if (closed) return;
+    const projectId = opts.getProjectId();
+    if (!projectId) return;
+    try {
+      const cmds = await api.claimOpenWorkspace(projectId);
+      for (const cmd of cmds) {
+        console.error(
+          `[codeassist-mcp] open workspace claim=${cmd.id} path=${cmd.workspacePath} ide=${cmd.ide}`,
+        );
+        const opened = openIdeWorkspace(cmd.ide, cmd.workspacePath);
+        const bridged = startBridgeForWorkspace({
+          ide: cmd.ide,
+          workspace: cmd.workspacePath,
+          serverUrl: opts.serverUrl,
+          token: opts.token,
+        });
+        const ok = opened.ok || bridged.ok;
+        const detail = [opened.detail, bridged.detail]
+          .filter(Boolean)
+          .join("；");
+        await api
+          .completeOpenWorkspace(
+            cmd.id,
+            ok ? "done" : "failed",
+            ok ? undefined : detail,
+          )
+          .catch(() => undefined);
+        console.error(
+          `[codeassist-mcp] open workspace ${ok ? "done" : "failed"}: ${detail}`,
+        );
+        notifyToast(
+          ok
+            ? `CodeAssist：已在 PC 打开 ${path.basename(cmd.workspacePath)}`
+            : `CodeAssist：打开项目失败`,
+        );
+      }
+    } catch (err) {
+      console.error("[codeassist-mcp] open-workspace drain error:", err);
     }
   }
 

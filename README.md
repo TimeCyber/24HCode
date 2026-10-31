@@ -118,6 +118,29 @@ Token：与 `ACCESS_TOKEN` 相同（默认 `codeassist-dev-token`）。
 | `DATA_DIR` | `./data` | SQLite 目录 |
 | `OFFLINE_MS` | `120000` | 项目离线判定 |
 
+### 开机自启动（可选）
+
+不想每次开机再手动起中继 / 跟 Agent 说「启动」时，可注册 **Windows 登录自启**（中继 + Cursor bridge）：
+
+```powershell
+cd <REPO>
+# 注册「用户登录时」自动启动（执行一次即可）
+powershell -ExecutionPolicy Bypass -File .\scripts\install-autostart.ps1
+
+# 也可立刻手动启动一次
+.\start-codeassist-all.bat
+```
+
+- 计划任务名：`CodeAssist Autostart`（登录当前用户时运行）
+- 日志：`packages/mcp-server/start-all.log`、`relay-server.log`、`cursor-bridge.log`
+- 卸载自启：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-autostart.ps1
+```
+
+说明：自启后手机刷新即可看到项目在线；仍建议日常开发时打开 Cursor/Codex 以便执行指令。不需要自启的用户可跳过本节，继续用上面的 `npm run start:server` 手动启动。
+
 ---
 
 ## 3. 配置 Cursor MCP

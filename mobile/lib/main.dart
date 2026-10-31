@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:provider/provider.dart';
 
@@ -14,6 +15,15 @@ import 'screens/setup_screen.dart';
 Future<void> main() async {
   await runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
+    // 保持系统状态栏/导航栏可见，避免沉浸式吃掉返回与 Home 手势
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        systemNavigationBarColor: Colors.transparent,
+        systemNavigationBarContrastEnforced: true,
+      ),
+    );
     CrashLogService.instance.installHooks();
     await CrashLogService.instance.init();
     await NotificationService.instance.init();
@@ -58,6 +68,8 @@ class RootGate extends StatefulWidget {
 }
 
 class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
+  DateTime? _lastBackAt;
+
   @override
   void initState() {
     super.initState();
@@ -92,12 +104,37 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
     }
   }
 
+  void _onRootBack() {
+    final nav = Navigator.of(context);
+    if (nav.canPop()) {
+      nav.pop();
+      return;
+    }
+    final now = DateTime.now();
+    final last = _lastBackAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 2)) {
+      SystemNavigator.pop();
+      return;
+    }
+    _lastBackAt = now;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('再按一次返回退出应用'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    if (!state.configured) {
-      return const SetupScreen();
-    }
-    return const HomeShell();
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        _onRootBack();
+      },
+      child: !state.configured ? const SetupScreen() : const HomeShell(),
+    );
   }
 }

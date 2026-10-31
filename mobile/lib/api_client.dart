@@ -34,6 +34,35 @@ class ApiClient {
         .toList();
   }
 
+  /// 请求 PC 端打开工作区（在线 MCP/桥接执行）
+  Future<Map<String, dynamic>> openWorkspace({
+    required String workspacePath,
+    String ide = 'cursor',
+    String? viaProjectId,
+  }) async {
+    final res = await http.post(
+      _uri('/api/projects/open'),
+      headers: _headers,
+      body: jsonEncode({
+        'workspacePath': workspacePath.trim(),
+        'ide': ide,
+        if (viaProjectId != null && viaProjectId.isNotEmpty)
+          'viaProjectId': viaProjectId,
+      }),
+    );
+    _ensureOk(res);
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> getOpenWorkspaceStatus(String id) async {
+    final res = await http.get(
+      _uri('/api/projects/open/$id'),
+      headers: _authHeaders,
+    );
+    _ensureOk(res);
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
   Future<List<TaskEvent>> listTasks({String? status}) async {
     final res = await http.get(
       _uri('/api/tasks', status == null ? null : {'status': status}),
@@ -203,6 +232,28 @@ class ApiClient {
         if (message != null && message.trim().isNotEmpty)
           'message': message.trim(),
       }),
+    );
+    _ensureOk(res);
+  }
+
+  /// 生成配对码（手机端）
+  Future<Map<String, dynamic>> createPairCode() async {
+    final res = await http.post(_uri('/pair/code'), headers: _headers);
+    _ensureOk(res);
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  Future<List<Map<String, dynamic>>> listPairedDevices() async {
+    final res = await http.get(_uri('/pair/devices'), headers: _authHeaders);
+    _ensureOk(res);
+    final list = jsonDecode(res.body) as List<dynamic>;
+    return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  }
+
+  Future<void> revokePairedDevice(String deviceId) async {
+    final res = await http.delete(
+      _uri('/pair/devices/$deviceId'),
+      headers: _authHeaders,
     );
     _ensureOk(res);
   }

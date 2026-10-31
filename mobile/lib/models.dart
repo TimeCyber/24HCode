@@ -20,6 +20,17 @@ class Project {
   /// UI 展示用：Cursor / Codex / Trae / WorkBuddy …
   String get ideLabel => ideDisplayName(ide);
 
+  /// 服务端 online 标志，或最近 [grace] 内有心跳，都视为在线（避免短暂断心跳闪离线）
+  bool isEffectivelyOnline([Duration grace = const Duration(minutes: 10)]) {
+    if (online) return true;
+    try {
+      final seen = DateTime.parse(lastSeenAt).toUtc();
+      return DateTime.now().toUtc().difference(seen) <= grace;
+    } catch (_) {
+      return false;
+    }
+  }
+
   factory Project.fromJson(Map<String, dynamic> json) => Project(
         id: json['id'] as String,
         name: json['name'] as String,

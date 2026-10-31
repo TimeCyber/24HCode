@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'api_client.dart';
+import 'auth_api.dart';
 import 'background_watch_service.dart';
 import 'ide_labels.dart';
 import 'models.dart';
@@ -14,19 +17,54 @@ import 'notification_service.dart';
 
 const _kBgNotifiedIds = 'bg_notified_prompt_ids';
 
+enum AttachmentDownloadStatus { idle, downloading, done, failed }
+
+class AttachmentDownloadState {
+  AttachmentDownloadState({
+    required this.fileId,
+    required this.status,
+    this.savedPath,
+    this.error,
+  });
+
+  final String fileId;
+  final AttachmentDownloadStatus status;
+  final String? savedPath;
+  final String? error;
+
+  bool get isBusy => status == AttachmentDownloadStatus.downloading;
+}
+
 class AppState extends ChangeNotifier {
   static const _kUrl = 'server_url';
+  static const _kApiRoot = 'api_root';
   static const _kToken = 'access_token';
+  static const _kUsername = 'username';
+  static const _kNickName = 'nick_name';
   static const _kActiveProject = 'active_project_id';
   static const _kActiveChat = 'active_chat_session_id';
+  static const _kConnMode = 'connection_mode';
+  static const _kRecentWorkspaces = 'recent_workspace_paths';
 
-  String serverUrl = 'http://10.0.2.2:8787';
-  String token = 'codeassist-dev-token';
+  /// `cloud` = mcp-x 账号登录；`lan` = 内网中继地址 + Token
+  String connectionMode = 'cloud';
+  /// CodeAssist 中继地址（云端 = apiRoot+/codeassist；内网 = 直接填 http://ip:8787）
+  String serverUrl = '';
+  /// RuoYi / mcp-x API 根，如 https://mcp-x.com/prod-api（仅云端模式）
+  String apiRoot = 'https://mcp-x.com/prod-api';
+  String token = '';
+  String username = '';
+  String nickName = '';
   bool configured = false;
+  bool get isLanMode => connectionMode == 'lan';
+  bool get isCloudMode => connectionMode != 'lan';
   bool connecting = false;
   String? error;
 
   List<Project> projects = [];
+  List<String> recentWorkspacePaths = [];
+  /// 附件下载状态（按 fileId），不绑在聊天气泡 State 上，避免滑动回收取消 UI
+  final Map<String, AttachmentDownloadState> attachmentDownloads = {};
   List<TaskEvent> tasks = [];
   List<PromptJob> prompts = [];
   List<PromptJob> chatMessages = [];
@@ -37,6 +75,7 @@ class AppState extends ChangeNotifier {
   String? activeChatSessionId;
 
   ApiClient? _api;
+  ApiClient? get apiOrNull => _api;
   WebSocketChannel? _ws;
   StreamSubscription? _wsSub;
   Timer? _reconnectTimer;
@@ -84,26 +123,189 @@ class AppState extends ChangeNotifier {
 
   Future<void> loadConfig() async {
     final prefs = await SharedPreferences.getInstance();
-    serverUrl = prefs.getString(_kUrl) ?? serverUrl;
+    apiRoot = prefs.getString(_kApiRoot) ?? apiRoot;
     token = prefs.getString(_kToken) ?? token;
+    username = prefs.getString(_kUsername) ?? '';
+    nickName = prefs.getString(_kNickName) ?? '';
     activeProjectId = prefs.getString(_kActiveProject);
     activeChatSessionId = prefs.getString(_kActiveChat);
-    configured = prefs.getString(_kUrl) != null;
+    recentWorkspacePaths = prefs.getStringList(_kRecentWorkspaces) ?? [];
+
+    final savedUrl = prefs.getString(_kUrl);
+    if (savedUrl != null && savedUrl.isNotEmpty) {
+      serverUrl = savedUrl;
+    } else if (apiRoot.isNotEmpty) {
+      serverUrl = AuthApi.relayBaseFromRoot(apiRoot);
+    }
+
+    final savedMode = prefs.getString(_kConnMode);
+    if (savedMode == 'lan' || savedMode == 'cloud') {
+      connectionMode = savedMode!;
+    } else {
+      // 兼容旧配置：无 /codeassist 且像 host:port → 内网
+      final u = serverUrl.toLowerCase();
+      final looksLan = u.isNotEmpty &&
+          !u.contains('/codeassist') &&
+          (u.contains('192.168.') ||
+              u.contains('10.') ||
+              u.contains('127.0.0.1') ||
+              u.contains('localhost') ||
+              RegExp(r':\d+$').hasMatch(u.replaceAll(RegExp(r'/+$'), '')));
+      connectionMode = looksLan ? 'lan' : 'cloud';
+    }
+
+    configured = token.isNotEmpty && serverUrl.isNotEmpty;
     notifyListeners();
     if (configured) {
       await connect();
     }
   }
 
-  Future<void> saveConfig(String url, String accessToken) async {
-    serverUrl = url.trim();
-    token = accessToken.trim();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kUrl, serverUrl);
-    await prefs.setString(_kToken, token);
-    configured = true;
+  /// 云端短信登录 mcp-x（与 Web /web/auth/sms/* 一致），成功后自动连中继 /codeassist
+  Future<void> login({
+    required String root,
+    required String phoneNumber,
+    required String smsCode,
+  }) async {
+    connecting = true;
+    error = null;
     notifyListeners();
-    await connect();
+    try {
+      final result = await AuthApi.smsLogin(
+        apiRoot: root,
+        phoneNumber: phoneNumber,
+        smsCode: smsCode,
+      );
+      connectionMode = 'cloud';
+      apiRoot = AuthApi.normalizeRoot(root);
+      serverUrl = AuthApi.relayBaseFromRoot(apiRoot);
+      token = result.token;
+      username = result.username ?? phoneNumber.trim();
+      nickName = result.nickName ?? '';
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kConnMode, connectionMode);
+      await prefs.setString(_kApiRoot, apiRoot);
+      await prefs.setString(_kUrl, serverUrl);
+      await prefs.setString(_kToken, token);
+      await prefs.setString(_kUsername, username);
+      await prefs.setString(_kNickName, nickName);
+      configured = true;
+      notifyListeners();
+      await connect();
+    } catch (e) {
+      connecting = false;
+      error = e.toString();
+      notifyListeners();
+      rethrow;
+    }
+  }
+
+  Future<void> sendSmsCode({
+    required String root,
+    required String phoneNumber,
+  }) async {
+    await AuthApi.sendSmsCode(apiRoot: root, phoneNumber: phoneNumber);
+  }
+
+  Future<void> logout() async {
+    _wsSub?.cancel();
+    _wsSub = null;
+    await _ws?.sink.close();
+    _ws = null;
+    _reconnectTimer?.cancel();
+    _progressPollTimer?.cancel();
+    _api = null;
+
+    token = '';
+    username = '';
+    nickName = '';
+    configured = false;
+    projects = [];
+    attachmentDownloads.clear();
+    tasks = [];
+    prompts = [];
+    chatMessages = [];
+    chatSessions = [];
+    sessions = [];
+    activeProjectId = null;
+    activeChatSessionId = null;
+    error = null;
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_kToken);
+    await prefs.remove(_kUsername);
+    await prefs.remove(_kNickName);
+    await prefs.remove(_kActiveProject);
+    await prefs.remove(_kActiveChat);
+    notifyListeners();
+  }
+
+  /// 内网直连：填本地/局域网中继地址 + ACCESS_TOKEN（不会自动拼 /codeassist）
+  Future<void> saveLanConfig({
+    required String relayUrl,
+    required String accessToken,
+  }) async {
+    connecting = true;
+    error = null;
+    notifyListeners();
+    try {
+      var url = relayUrl.trim().replaceAll(RegExp(r'/+$'), '');
+      if (url.endsWith('/codeassist')) {
+        url = url.substring(0, url.length - '/codeassist'.length);
+      }
+      if (url.endsWith('/api')) {
+        url = url.substring(0, url.length - '/api'.length);
+      }
+      connectionMode = 'lan';
+      serverUrl = url;
+      token = accessToken.trim();
+      username = '';
+      nickName = '';
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kConnMode, connectionMode);
+      await prefs.setString(_kUrl, serverUrl);
+      await prefs.setString(_kToken, token);
+      await prefs.remove(_kUsername);
+      await prefs.remove(_kNickName);
+      configured = true;
+      notifyListeners();
+      await connect();
+    } catch (e) {
+      connecting = false;
+      error = e.toString();
+      notifyListeners();
+      rethrow;
+    }
+  }
+
+  /// 兼容旧入口：带 /codeassist 当云端中继；否则当内网直连
+  Future<void> saveConfig(String url, String accessToken) async {
+    final trimmed = url.trim().replaceAll(RegExp(r'/+$'), '');
+    if (trimmed.contains('/codeassist') ||
+        trimmed.contains('mcp-x.com') ||
+        trimmed.contains('prod-api')) {
+      connectionMode = 'cloud';
+      if (trimmed.endsWith('/codeassist')) {
+        serverUrl = trimmed;
+        apiRoot = AuthApi.normalizeRoot(trimmed);
+      } else {
+        apiRoot = AuthApi.normalizeRoot(trimmed);
+        serverUrl = AuthApi.relayBaseFromRoot(apiRoot);
+      }
+      token = accessToken.trim();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kConnMode, connectionMode);
+      await prefs.setString(_kApiRoot, apiRoot);
+      await prefs.setString(_kUrl, serverUrl);
+      await prefs.setString(_kToken, token);
+      configured = true;
+      notifyListeners();
+      await connect();
+      return;
+    }
+    await saveLanConfig(relayUrl: trimmed, accessToken: accessToken);
   }
 
   Future<void> _persistSelection() async {
@@ -128,6 +330,7 @@ class AppState extends ChangeNotifier {
     try {
       await refreshAll();
       _connectWs();
+      _ensureProgressPolling();
       connecting = false;
       notifyListeners();
     } catch (e) {
@@ -147,7 +350,7 @@ class AppState extends ChangeNotifier {
 
     if (activeProjectId == null ||
         !projects.any((p) => p.id == activeProjectId)) {
-      final online = projects.where((p) => p.online).toList();
+      final online = projects.where((p) => p.isEffectivelyOnline()).toList();
       activeProjectId = online.isNotEmpty
           ? online.first.id
           : (projects.isNotEmpty ? projects.first.id : null);
@@ -352,6 +555,78 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _rememberWorkspacePath(String path) async {
+    final p = path.trim();
+    if (p.isEmpty) return;
+    final next = [p, ...recentWorkspacePaths.where((e) => e != p)];
+    if (next.length > 12) next.removeRange(12, next.length);
+    recentWorkspacePaths = next;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_kRecentWorkspaces, recentWorkspacePaths);
+    notifyListeners();
+  }
+
+  /// 手机控制 PC：打开工作区 → 桥接注册 → 刷新项目列表
+  Future<String> openWorkspaceOnPc({
+    required String workspacePath,
+    String ide = 'cursor',
+  }) async {
+    final api = _api;
+    if (api == null) throw Exception('未连接中继');
+    final path = workspacePath.trim();
+    if (path.isEmpty) throw Exception('请填写 PC 上的项目路径');
+
+    String? via;
+    final matchIde = projects
+        .where((p) => p.ide == ide && p.isEffectivelyOnline())
+        .toList();
+    if (matchIde.isNotEmpty) {
+      via = matchIde.any((p) => p.id == activeProjectId)
+          ? activeProjectId
+          : matchIde.first.id;
+    } else {
+      final anyOnline =
+          projects.where((p) => p.isEffectivelyOnline()).toList();
+      if (anyOnline.isNotEmpty) via = anyOnline.first.id;
+    }
+
+    final created = await api.openWorkspace(
+      workspacePath: path,
+      ide: ide,
+      viaProjectId: via,
+    );
+    await _rememberWorkspacePath(path);
+
+    final id = created['id'] as String?;
+    String status = (created['status'] as String?) ?? 'queued';
+    String? err = created['error'] as String?;
+
+    // 等待 PC 认领执行（最多约 20s），期间多次刷新项目列表
+    for (var i = 0; i < 10; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 1800));
+      await refreshAll();
+      if (id != null) {
+        try {
+          final st = await api.getOpenWorkspaceStatus(id);
+          status = (st['status'] as String?) ?? status;
+          err = st['error'] as String?;
+          if (status == 'done' || status == 'failed') break;
+        } catch (_) {
+          /* ignore poll errors */
+        }
+      }
+    }
+    await refreshAll();
+
+    if (status == 'failed') {
+      throw Exception(err?.isNotEmpty == true ? err! : 'PC 打开项目失败');
+    }
+    if (status == 'queued' || status == 'claimed') {
+      return '已下发打开指令，请稍后点刷新查看新项目（状态：$status）';
+    }
+    return 'PC 已打开，项目列表已刷新';
+  }
+
   Future<void> selectChatSession(String sessionId) async {
     if (activeChatSessionId == sessionId) return;
     activeChatSessionId = sessionId;
@@ -431,6 +706,68 @@ class AppState extends ChangeNotifier {
     return api.downloadFileBytes(fileId);
   }
 
+  AttachmentDownloadState? attachmentDownloadOf(String fileId) =>
+      attachmentDownloads[fileId];
+
+  Future<Directory> _resolveAttachmentSaveDir() async {
+    if (!kIsWeb && Platform.isAndroid) {
+      final ext = await getExternalStorageDirectory();
+      if (ext != null) {
+        final d = Directory('${ext.path}/CodeAssistDownloads');
+        if (!await d.exists()) await d.create(recursive: true);
+        return d;
+      }
+    }
+    final docs = await getApplicationDocumentsDirectory();
+    final d = Directory('${docs.path}/CodeAssistDownloads');
+    if (!await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  /// 下载附件到本地；状态保存在 [attachmentDownloads]，滑动聊天不会中断/清空进度
+  Future<AttachmentDownloadState> downloadAttachmentFile({
+    required String fileId,
+    required String fileName,
+  }) async {
+    final current = attachmentDownloads[fileId];
+    if (current?.status == AttachmentDownloadStatus.downloading) {
+      return current!;
+    }
+
+    attachmentDownloads[fileId] = AttachmentDownloadState(
+      fileId: fileId,
+      status: AttachmentDownloadStatus.downloading,
+      savedPath: current?.savedPath,
+    );
+    notifyListeners();
+
+    try {
+      final bytes = await downloadAttachmentBytes(fileId);
+      final saveDir = await _resolveAttachmentSaveDir();
+      final safeName = fileName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+      final file = File('${saveDir.path}/$safeName');
+      await file.writeAsBytes(bytes, flush: true);
+      final done = AttachmentDownloadState(
+        fileId: fileId,
+        status: AttachmentDownloadStatus.done,
+        savedPath: file.path,
+      );
+      attachmentDownloads[fileId] = done;
+      notifyListeners();
+      return done;
+    } catch (e) {
+      final failed = AttachmentDownloadState(
+        fileId: fileId,
+        status: AttachmentDownloadStatus.failed,
+        savedPath: current?.savedPath,
+        error: e.toString(),
+      );
+      attachmentDownloads[fileId] = failed;
+      notifyListeners();
+      return failed;
+    }
+  }
+
   Future<void> sendImageToAgent({
     required String fileName,
     required List<int> bytes,
@@ -469,17 +806,23 @@ class AppState extends ChangeNotifier {
     _wsSub?.cancel();
     _ws?.sink.close();
     final httpUrl = serverUrl.replaceAll(RegExp(r'/+$'), '');
-    final wsUrl = httpUrl
+    // 云端：.../codeassist/ws ；本地 Node：.../ws
+    final wsUrl = '$httpUrl/ws'
         .replaceFirst(RegExp(r'^http'), 'ws')
         .replaceFirst(RegExp(r'^https'), 'wss');
-    final uri = Uri.parse('$wsUrl/ws?token=${Uri.encodeComponent(token)}');
-    _ws = WebSocketChannel.connect(uri);
-    _wsSub = _ws!.stream.listen(
-      _onWsMessage,
-      onError: (_) => _scheduleReconnect(),
-      onDone: _scheduleReconnect,
-    );
-    _sendSubscribe();
+    final uri = Uri.parse('$wsUrl?token=${Uri.encodeComponent(token)}');
+    try {
+      _ws = WebSocketChannel.connect(uri);
+      _wsSub = _ws!.stream.listen(
+        _onWsMessage,
+        onError: (_) => _scheduleReconnect(),
+        onDone: _scheduleReconnect,
+      );
+      _sendSubscribe();
+    } catch (_) {
+      // WS 失败时仍靠轮询
+      _ensureProgressPolling();
+    }
   }
 
   void _sendSubscribe() {

@@ -20,7 +20,7 @@ class ProjectsTab extends StatelessWidget {
           selected: selected,
           title: Text(p.displayName),
           subtitle: Text('${p.ideLabel} · ${p.workspacePath}'),
-          trailing: Text(p.online ? '在线' : '离线'),
+          trailing: Text(p.isEffectivelyOnline() ? '在线' : '离线'),
           onTap: () => state.selectProject(p.id),
         );
       },

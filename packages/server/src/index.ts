@@ -8,6 +8,7 @@ import {
   CreateFileTransferRequestSchema,
   CreatePromptRequestSchema,
   CreateTaskRequestSchema,
+  OpenWorkspaceRequestSchema,
   RegisterProjectRequestSchema,
   SubmitDecisionRequestSchema,
   SyncSessionContextRequestSchema,
@@ -27,7 +28,8 @@ const ACCESS_TOKEN = process.env.ACCESS_TOKEN ?? "codeassist-dev-token";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
 const DB_PATH = process.env.DB_PATH ?? path.join(DATA_DIR, "codeassist.db");
 const FILES_DIR = process.env.FILES_DIR ?? path.join(DATA_DIR, "files");
-const OFFLINE_MS = Number(process.env.OFFLINE_MS ?? 120_000);
+/** 无心跳超过此时长才标离线（默认 10 分钟；过短会导致手机经常闪离线） */
+const OFFLINE_MS = Number(process.env.OFFLINE_MS ?? 10 * 60 * 1000);
 /**
  * 指令卡在 running/delivered 且长时间无心跳则自动失败。
  * 默认 50 分钟：对齐 Agent 绝对上限，避免正常长任务被服务端误杀。
@@ -55,22 +57,36 @@ const app = Fastify({
 });
 await app.register(cors, { origin: true });
 
-// DELETE/GET 若带了 Content-Type: application/json 但无 body，默认会 400；放宽为空对象
+// DELETE/GET/心跳 POST 若带了 Content-Type 但无 body，或缺少 Content-Type，放宽解析，避免 400/415
+const parseLooseBody = (
+  body: string | Buffer,
+  done: (err: Error | null, body?: unknown) => void,
+) => {
+  try {
+    const raw = typeof body === "string" ? body : body.toString("utf8");
+    if (!raw || !raw.trim()) {
+      done(null, {});
+      return;
+    }
+    const t = raw.trim();
+    if (t.startsWith("{") || t.startsWith("[")) {
+      done(null, JSON.parse(t));
+      return;
+    }
+    done(null, {});
+  } catch (err) {
+    done(err as Error, undefined);
+  }
+};
 app.addContentTypeParser(
   "application/json",
   { parseAs: "string" },
-  (req, body, done) => {
-    try {
-      const raw = typeof body === "string" ? body : "";
-      if (!raw || !raw.trim()) {
-        done(null, {});
-        return;
-      }
-      done(null, JSON.parse(raw));
-    } catch (err) {
-      done(err as Error, undefined);
-    }
-  },
+  (_req, body, done) => parseLooseBody(body, done),
+);
+app.addContentTypeParser(
+  "*",
+  { parseAs: "string" },
+  (_req, body, done) => parseLooseBody(body, done),
 );
 
 app.addHook("onRequest", async (req, reply) => {
@@ -98,13 +114,71 @@ app.post("/api/projects/register", async (req, reply) => {
 
 app.post("/api/projects/:id/heartbeat", async (req, reply) => {
   const { id } = req.params as { id: string };
+  const before = store.getProject(id);
   const project = store.heartbeat(id);
   if (!project) return reply.code(404).send({ error: "project not found" });
-  hub.broadcast("project.online", project, project.id);
+  // 仅在「离线→在线」时广播，避免每几秒刷一次导致客户端抖动
+  if (!before?.online) {
+    hub.broadcast("project.online", project, project.id);
+  }
   return project;
 });
 
 app.get("/api/projects", async () => store.listProjects());
+
+/** 手机：请求 PC 端打开指定工作区（由在线 MCP/桥接认领执行） */
+app.post("/api/projects/open", async (req, reply) => {
+  const parsed = OpenWorkspaceRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const data = { ...parsed.data };
+  if (!data.viaProjectId) {
+    const via = store.findOnlineProjectForIde(data.ide);
+    if (via) data.viaProjectId = via.id;
+  }
+  if (data.viaProjectId && !store.getProject(data.viaProjectId)) {
+    return reply.code(404).send({ error: "via project not found" });
+  }
+  const onlineAny = store.listProjects().some((p) => p.online);
+  if (!onlineAny) {
+    return reply
+      .code(409)
+      .send({ error: "no online PC project; open Cursor/Codex MCP or bridge first" });
+  }
+  const cmd = store.enqueueOpenWorkspace(data);
+  // 推给指定项目；无 via 时广播给全部在线 MCP
+  hub.broadcast("project.open", cmd, cmd.viaProjectId);
+  return cmd;
+});
+
+app.get("/api/projects/open/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const cmd = store.getOpenWorkspace(id);
+  if (!cmd) return reply.code(404).send({ error: "open command not found" });
+  return cmd;
+});
+
+app.get("/api/mcp/open-workspace", async (req, reply) => {
+  const projectId = String(
+    (req.query as { projectId?: string }).projectId ?? "",
+  ).trim();
+  if (!projectId) {
+    return reply.code(400).send({ error: "projectId required" });
+  }
+  const cmd = store.claimOpenWorkspace(projectId);
+  return cmd ? [cmd] : [];
+});
+
+app.post("/api/mcp/open-workspace/:id/complete", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const body = (req.body ?? {}) as { status?: string; error?: string };
+  const status = body.status === "failed" ? "failed" : "done";
+  const cmd = store.completeOpenWorkspace(id, status, body.error);
+  if (!cmd) return reply.code(404).send({ error: "open command not found" });
+  hub.broadcast("project.open", cmd, cmd.viaProjectId ?? cmd.claimedBy);
+  return cmd;
+});
 
 app.post("/api/tasks", async (req, reply) => {
   const parsed = CreateTaskRequestSchema.safeParse(req.body);
