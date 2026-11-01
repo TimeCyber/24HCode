@@ -395,7 +395,18 @@ class _PromptsTabState extends State<PromptsTab> {
           ),
         ),
         Expanded(
-          child: project == null
+          child: state.needsDevicePairing
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      '请先完成上方「配对连接」绑定家里电脑，绑定后再选择项目开始对话。',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                  ),
+                )
+              : project == null
               ? Center(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,

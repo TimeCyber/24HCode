@@ -36,7 +36,8 @@ class _DevicesScreenState extends State<DevicesScreen> {
   }
 
   Future<void> _refreshDevices() async {
-    final api = context.read<AppState>().apiOrNull;
+    final state = context.read<AppState>();
+    final api = state.apiOrNull;
     if (api == null) {
       setState(() => _error = '请先登录');
       return;
@@ -46,9 +47,9 @@ class _DevicesScreenState extends State<DevicesScreen> {
       _error = null;
     });
     try {
-      final list = await api.listPairedDevices();
+      await state.refreshPairedDevices();
       if (!mounted) return;
-      setState(() => _devices = list);
+      setState(() => _devices = List<Map<String, dynamic>>.from(state.pairedDevices));
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString().replaceFirst('Exception: ', ''));

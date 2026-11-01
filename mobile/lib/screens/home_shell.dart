@@ -105,9 +105,12 @@ class HomeShell extends StatelessWidget {
                   MaterialPageRoute(builder: (_) => const SetupScreen()),
                 );
               } else if (v == 'devices') {
-                Navigator.of(context).push(
+                await Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const DevicesScreen()),
                 );
+                if (context.mounted) {
+                  await context.read<AppState>().refreshPairedDevices();
+                }
               } else if (v == 'logout') {
                 await state.logout();
                 if (context.mounted) {
@@ -142,8 +145,72 @@ class HomeShell extends StatelessWidget {
                 ),
               ],
             ),
+          if (state.needsDevicePairing) const _PairDeviceBanner(),
           const Expanded(child: PromptsTab()),
         ],
+      ),
+    );
+  }
+}
+
+/// 云端登录后尚未配对电脑时，在首页给出明确下一步
+class _PairDeviceBanner extends StatelessWidget {
+  const _PairDeviceBanner();
+
+  Future<void> _openPairing(BuildContext context) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const DevicesScreen()),
+    );
+    if (!context.mounted) return;
+    await context.read<AppState>().refreshPairedDevices();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.link, color: scheme.onPrimaryContainer),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '下一步：配对连接家里电脑',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                              color: scheme.onPrimaryContainer,
+                              fontWeight: FontWeight.w600,
+                            ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '登录成功后还需要绑定运行 Cursor/Codex 的电脑，否则无法下发指令。',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              color: scheme.onPrimaryContainer,
+                            ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: () => _openPairing(context),
+              icon: const Icon(Icons.qr_code_2),
+              label: const Text('去配对连接'),
+            ),
+          ],
+        ),
       ),
     );
   }

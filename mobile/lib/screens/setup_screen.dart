@@ -292,7 +292,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       '· 手机与电脑需同一 Wi‑Fi，且防火墙放行 8787'
                   : '云端说明：\n'
                       '· 服务固定：https://mcp-x.com/prod-api（不可修改）\n'
-                      '· 登录后到「设备配对」生成配对码绑定家里电脑',
+                      '· 登录后首页会提示「去配对连接」，生成配对码绑定家里电脑',
               style: Theme.of(context).textTheme.bodySmall,
             ),
           ],

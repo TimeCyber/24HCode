@@ -70,6 +70,10 @@ class AppState extends ChangeNotifier {
   List<PromptJob> chatMessages = [];
   List<ChatSession> chatSessions = [];
   List<SessionContext> sessions = [];
+  /// 云端已配对的家里电脑；内网模式不使用
+  List<Map<String, dynamic>> pairedDevices = [];
+  /// 是否已成功拉取过配对列表（避免加载中误提示）
+  bool pairedDevicesLoaded = false;
 
   String? activeProjectId;
   String? activeChatSessionId;
@@ -93,6 +97,10 @@ class AppState extends ChangeNotifier {
       return null;
     }
   }
+
+  /// 云端已登录但尚未绑定电脑：首页应引导去「设备配对」
+  bool get needsDevicePairing =>
+      isCloudMode && pairedDevicesLoaded && pairedDevices.isEmpty;
 
   /// Windows 路径大小写不同会产生重复「离线项目」，按规范化路径去重。
   static String _normPath(String p) =>
@@ -228,6 +236,8 @@ class AppState extends ChangeNotifier {
     chatMessages = [];
     chatSessions = [];
     sessions = [];
+    pairedDevices = [];
+    pairedDevicesLoaded = false;
     activeProjectId = null;
     activeChatSessionId = null;
     error = null;
@@ -341,6 +351,23 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<void> refreshPairedDevices() async {
+    final api = _api;
+    if (api == null || isLanMode) {
+      pairedDevices = [];
+      pairedDevicesLoaded = isLanMode;
+      notifyListeners();
+      return;
+    }
+    try {
+      pairedDevices = await api.listPairedDevices();
+      pairedDevicesLoaded = true;
+    } catch (_) {
+      // 拉取失败不误判为「未配对」，保持上次结果；首次失败则仍视为未确认
+    }
+    notifyListeners();
+  }
+
   Future<void> refreshAll() async {
     final api = _api;
     if (api == null) return;
@@ -363,6 +390,17 @@ class AppState extends ChangeNotifier {
       sessions = [];
       // 会话上下文失败不阻断首页（云端缺表时曾整页崩溃）
       errors.add('会话上下文: $e');
+    }
+    if (isCloudMode) {
+      try {
+        pairedDevices = await api.listPairedDevices();
+        pairedDevicesLoaded = true;
+      } catch (e) {
+        errors.add('配对设备: $e');
+      }
+    } else {
+      pairedDevices = [];
+      pairedDevicesLoaded = true;
     }
 
     if (activeProjectId == null ||
