@@ -7,6 +7,18 @@ packages/server/data/
 .env
 .env.local
 packages/mcp-server/.codeassist-device.env
+packages/mcp-server/_sessions.json
+*.bak
+# HarmonyOS æœ¬åœ°/æ„å»ºäº§ç‰©
+mobile_ohos/.dart_tool/
+mobile_ohos/build/
+mobile_ohos/ohos/**/build/
+mobile_ohos/_har_patch/
+mobile_ohos/_probe_sdk.js
+mobile_ohos/_scan_p7b.*
+# å…è®¸ releases æ‰˜ç®¡é¸¿è’™åŒ…
+!releases/**/*.hap
+!releases/**/*.app
 mobile/.dart_tool/
 mobile/.flutter-plugins-dependencies
 mobile/.packages
@@ -32,3 +44,11 @@ mobile/_*.bat
 mobile/_*.txt
 mobile/build_*.txt
 mobile/_pack_log.txt
+
+downloads/
+
+# HarmonyOS Ç©Ãû²ÄÁÏÎğÈë¿â
+*.p7b
+mobile_ohos/**/*.p7b
+mobile_ohos/profile_release.*
+mobile_ohos/ohos/*Release*

@@ -28,6 +28,7 @@ class _PromptsTabState extends State<PromptsTab> {
   final _focusNode = FocusNode();
   bool _sending = false;
   bool _hasText = false;
+  bool _projectPickerOpen = false;
 
   @override
   void initState() {
@@ -86,10 +87,14 @@ class _PromptsTabState extends State<PromptsTab> {
   }
 
   Future<void> _openProjectPicker() async {
+    // 与标题栏「目录」一致：先弹层再后台刷新，避免 refreshAll 卡住导致连点堆多个 sheet
+    if (_projectPickerOpen) return;
+    _projectPickerOpen = true;
     final state = context.read<AppState>();
-    await state.refreshAll();
-    if (!mounted) return;
-    await showModalBottomSheet<void>(
+    unawaited(state.refreshAll());
+    try {
+      if (!mounted) return;
+      await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       builder: (ctx) {
@@ -174,6 +179,9 @@ class _PromptsTabState extends State<PromptsTab> {
         );
       },
     );
+    } finally {
+      _projectPickerOpen = false;
+    }
   }
 
   Future<void> _addSession() async {

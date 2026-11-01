@@ -1,0 +1,1089 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
+import 'package:share_plus/share_plus.dart';
+import '../app_state.dart';
+import '../crash_log_service.dart';
+import '../ide_labels.dart';
+import '../models.dart';
+import '../safe_speech.dart';
+import '../widgets/linkified_text.dart';
+
+class PromptsTab extends StatefulWidget {
+  const PromptsTab({super.key});
+
+  @override
+  State<PromptsTab> createState() => _PromptsTabState();
+}
+
+class _PromptsTabState extends State<PromptsTab> {
+  final _controller = TextEditingController();
+  final _scrollController = ScrollController();
+  final _focusNode = FocusNode();
+  bool _sending = false;
+  bool _hasText = false;
+  bool _projectPickerOpen = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_onInputChanged);
+  }
+
+  void _onInputChanged() {
+    final next = _controller.text.trim().isNotEmpty;
+    if (next != _hasText) setState(() => _hasText = next);
+  }
+
+  /// ListView reverse:true 时，offset 0 = 最新消息（视觉底部）
+  void _scrollToLatest({bool animate = true}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      if (animate) {
+        _scrollController.animateTo(
+          0,
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+        );
+      } else {
+        _scrollController.jumpTo(0);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_onInputChanged);
+    _controller.dispose();
+    _scrollController.dispose();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  Future<void> _send() async {
+    final content = _controller.text.trim();
+    if (content.isEmpty || _sending) return;
+    _focusNode.unfocus();
+    setState(() => _sending = true);
+    try {
+      await context.read<AppState>().sendPrompt(content);
+      _controller.clear();
+      _scrollToLatest();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.toString())),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  Future<void> _openProjectPicker() async {
+    // 与标题栏「目录」一致：先弹层再后台刷新，避免 refreshAll 卡住导致连点堆多个 sheet
+    if (_projectPickerOpen) return;
+    _projectPickerOpen = true;
+    final state = context.read<AppState>();
+    unawaited(state.refreshAll());
+    try {
+      if (!mounted) return;
+      await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return Consumer<AppState>(
+          builder: (context, s, _) {
+            return SafeArea(
+              child: SizedBox(
+                height: MediaQuery.of(ctx).size.height * 0.65,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 16, 8, 8),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '连接 / 选择 AI 项目',
+                              style: Theme.of(ctx).textTheme.titleMedium,
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: '刷新项目列表',
+                            onPressed: () => s.refreshAll(),
+                            icon: const Icon(Icons.refresh),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Text(
+                        '在 PC 上打开工作区并启用 MCP（Cursor / Codex / Trae / WorkBuddy 等）后，项目会出现在这里。对话按项目隔离。',
+                        style: Theme.of(ctx).textTheme.bodySmall,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: s.projects.isEmpty
+                          ? const Center(
+                              child: Text('暂无项目，请先在 PC 打开 AI 工具并启用 MCP'),
+                            )
+                          : ListView.separated(
+                              itemCount: s.projects.length,
+                              separatorBuilder: (_, __) =>
+                                  const Divider(height: 1),
+                              itemBuilder: (_, i) {
+                                final p = s.projects[i];
+                                final selected = s.activeProjectId == p.id;
+                                return ListTile(
+                                  selected: selected,
+                                  leading: Icon(
+                                    Icons.circle,
+                                    size: 12,
+                                    color:
+                                        p.isEffectivelyOnline()
+                                            ? Colors.green
+                                            : Colors.grey,
+                                  ),
+                                  title: Text(p.displayName),
+                                  subtitle: Text(
+                                    '${p.isEffectivelyOnline() ? '在线' : '离线'} · ${p.ideLabel} · ${p.workspacePath}',
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  trailing: selected
+                                      ? const Icon(Icons.check)
+                                      : null,
+                                  onTap: () async {
+                                    await s.selectProject(p.id);
+                                    if (ctx.mounted) Navigator.pop(ctx);
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    } finally {
+      _projectPickerOpen = false;
+    }
+  }
+
+  Future<void> _addSession() async {
+    try {
+      await context.read<AppState>().addChatSession();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('已新建会话（对应 PC 侧新 Session）')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.toString())),
+        );
+      }
+    }
+  }
+
+  Future<void> _confirmDeleteSession(ChatSession session) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除会话'),
+        content: Text('确定删除「${session.title}」？该会话内的消息也会删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      await context.read<AppState>().deleteChatSession(session.id);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已删除「${session.title}」')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('删除失败：$e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _pickAndSendImage(ImageSource source) async {
+    final project = context.read<AppState>().activeProject;
+    if (project == null || _sending) return;
+    final picker = ImagePicker();
+    final picked = await picker.pickImage(
+      source: source,
+      maxWidth: 2048,
+      maxHeight: 2048,
+      imageQuality: 85,
+    );
+    if (picked == null || !mounted) return;
+
+    setState(() => _sending = true);
+    try {
+      final bytes = await picked.readAsBytes();
+      final name = picked.name.trim().isNotEmpty
+          ? picked.name
+          : 'photo_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final mime = picked.mimeType ??
+          (name.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg');
+      final caption = _controller.text.trim();
+      await context.read<AppState>().sendImageToAgent(
+            fileName: name,
+            bytes: bytes,
+            mimeType: mime,
+            message: caption.isEmpty ? null : caption,
+          );
+      _controller.clear();
+      _scrollToLatest();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('发送图片失败：$e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  Future<void> _showImageSourceSheet() async {
+    if (context.read<AppState>().activeProject == null) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.photo_library_outlined),
+                title: const Text('从相册选择'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  unawaited(_pickAndSendImage(ImageSource.gallery));
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.photo_camera_outlined),
+                title: const Text('拍照'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  unawaited(_pickAndSendImage(ImageSource.camera));
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  String _statusHint(PromptJob m) {
+    if (m.attachment != null && !m.attachment!.isToAgent) return '文件';
+    final hasResult = m.result != null && m.result!.trim().isNotEmpty;
+    if (hasResult && (m.status == 'done' || m.status == 'failed')) {
+      return m.status == 'failed' ? '失败' : '完成';
+    }
+    if (hasResult &&
+        (m.status == 'running' ||
+            m.status == 'delivered' ||
+            m.status == 'queued')) {
+      // 结果已回传但状态偶发未刷新
+      return '完成';
+    }
+    switch (m.status) {
+      case 'queued':
+        return '排队等待…';
+      case 'delivered':
+        return '已拉取…';
+      case 'running':
+        return '执行中…';
+      case 'done':
+        return '完成';
+      case 'failed':
+        return '失败';
+      default:
+        return m.status;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final project = state.activeProject;
+    final ideLabel = project?.ideLabel ?? kGenericIdeLabel;
+    final sessions = state.chatSessions;
+    final messages = state.chatMessages;
+    final chat = state.activeChatSession;
+
+    return Column(
+      children: [
+        Material(
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 4, 4, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: [
+                        for (final s in sessions)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: GestureDetector(
+                              onLongPress: () => _confirmDeleteSession(s),
+                              child: ChoiceChip(
+                                label: Text(s.title),
+                                selected: state.activeChatSessionId == s.id,
+                                onSelected: (_) =>
+                                    state.selectChatSession(s.id),
+                              ),
+                            ),
+                          ),
+                        ActionChip(
+                          avatar: const Icon(Icons.add, size: 18),
+                          label: const Text('新会话'),
+                          onPressed: project == null ? null : _addSession,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '选择 / 连接项目',
+                  onPressed: _openProjectPicker,
+                  icon: Icon(
+                    project == null
+                        ? Icons.link_off
+                        : Icons.folder_special_outlined,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        Expanded(
+          child: project == null
+              ? Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('请先选择要对话的 $ideLabel 项目'),
+                      const SizedBox(height: 12),
+                      FilledButton.icon(
+                        onPressed: _openProjectPicker,
+                        icon: const Icon(Icons.link),
+                        label: const Text('连接项目'),
+                      ),
+                    ],
+                  ),
+                )
+              : messages.isEmpty
+                  ? Center(
+                      child: Text(
+                        chat?.hasContext == true
+                            ? '本会话已有 $ideLabel 上下文，继续发指令即可'
+                            : '在本会话发送指令，同一 Session 会保持 $ideLabel 上下文',
+                      ),
+                    )
+                  : ListView.builder(
+                      controller: _scrollController,
+                      // reverse：打开会话时默认停在最新消息（底部）
+                      reverse: true,
+                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                      itemCount: messages.length,
+                      itemBuilder: (context, index) {
+                        final m = messages[messages.length - 1 - index];
+                        return _MessageBubble(
+                          key: ValueKey(m.id),
+                          message: m,
+                          statusHint: _statusHint(m),
+                        );
+                      },
+                    ),
+        ),
+        _ComposerBar(
+          controller: _controller,
+          focusNode: _focusNode,
+          enabled: project != null && !_sending,
+          canSend: project != null && !_sending && _hasText,
+          sending: _sending,
+          hasProject: project != null,
+          ideLabel: ideLabel,
+          onSend: _send,
+          onPickImage: _showImageSourceSheet,
+        ),
+      ],
+    );
+  }
+}
+
+class _ComposerBar extends StatefulWidget {
+  const _ComposerBar({
+    required this.controller,
+    required this.focusNode,
+    required this.enabled,
+    required this.canSend,
+    required this.sending,
+    required this.hasProject,
+    required this.ideLabel,
+    required this.onSend,
+    required this.onPickImage,
+  });
+
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final bool enabled;
+  final bool canSend;
+  final bool sending;
+  final bool hasProject;
+  final String ideLabel;
+  final VoidCallback onSend;
+  final VoidCallback onPickImage;
+
+  @override
+  State<_ComposerBar> createState() => _ComposerBarState();
+}
+
+class _ComposerBarState extends State<_ComposerBar> {
+  bool _listening = false;
+  bool _voiceBusy = false;
+  bool _fingerDown = false;
+  Timer? _longPressTimer;
+  int? _activePointer;
+
+  String get _hint {
+    if (_listening) return '正在打开系统语音…';
+    if (!widget.hasProject) return '请先右上角连接 AI 项目';
+    if (widget.sending) return '正在发送…';
+    return '输入指令，长按语音';
+  }
+
+  void _safeSetState(VoidCallback fn) {
+    if (!mounted) return;
+    try {
+      setState(fn);
+    } catch (_) {}
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    try {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg), duration: const Duration(seconds: 3)),
+      );
+    } catch (_) {}
+  }
+
+  void _appendSpeech(String words) {
+    final text = words.trim();
+    if (text.isEmpty) return;
+    var prefix = widget.controller.text;
+    if (prefix.isNotEmpty &&
+        !prefix.endsWith(' ') &&
+        !prefix.endsWith('\n')) {
+      prefix = '$prefix ';
+    }
+    final next = '$prefix$text';
+    try {
+      widget.controller.value = TextEditingValue(
+        text: next,
+        selection: TextSelection.collapsed(offset: next.length),
+      );
+    } catch (_) {}
+  }
+
+  /// 华为安卓10：SpeechRecognizer 会 bind FakeRecognitionService 直接闪退。
+  /// 改为系统 RecognizerIntent（弹系统语音界面）。
+  Future<void> _startSafeVoice() async {
+    if (!widget.enabled || _listening || _voiceBusy) return;
+    if (!Platform.isAndroid) {
+      _snack('当前仅安卓支持语音输入');
+      return;
+    }
+    _voiceBusy = true;
+    unawaited(CrashLogService.instance.log('voice', 'safeSpeech begin'));
+
+    var mic = await Permission.microphone.status;
+    if (!mic.isGranted) {
+      mic = await Permission.microphone.request();
+    }
+    if (!mic.isGranted) {
+      _voiceBusy = false;
+      _snack('需要麦克风权限才能语音输入');
+      try {
+        await openAppSettings();
+      } catch (_) {}
+      return;
+    }
+
+    try {
+      widget.focusNode.unfocus();
+      await SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
+    } catch (_) {}
+
+    _safeSetState(() => _listening = true);
+    try {
+      await HapticFeedback.lightImpact();
+    } catch (_) {}
+
+    try {
+      unawaited(CrashLogService.instance.log('voice', 'before safe recognize'));
+      final text = await SafeSpeech.recognize(
+        locale: 'zh-CN',
+        prompt: '请说出要发给 AI 的指令',
+      );
+      unawaited(
+        CrashLogService.instance.log(
+          'voice',
+          'safe recognize done len=${text.length}',
+        ),
+      );
+      if (text.isEmpty) {
+        _snack('未识别到内容');
+      } else {
+        _appendSpeech(text);
+      }
+    } on PlatformException catch (e, st) {
+      unawaited(CrashLogService.instance.logError('safe_speech', e, st));
+      final msg = e.message ?? e.code;
+      _snack(
+        msg.contains('谷歌') || e.code == 'no_speech'
+            ? msg
+            : '语音失败：$msg（华为机请安装谷歌或系统语音输入）',
+      );
+    } catch (e, st) {
+      unawaited(CrashLogService.instance.logError('safe_speech', e, st));
+      _snack('语音失败：$e');
+    } finally {
+      _voiceBusy = false;
+      _safeSetState(() => _listening = false);
+      unawaited(CrashLogService.instance.log('voice', 'safeSpeech end'));
+    }
+  }
+
+  void _onPointerDown(PointerDownEvent e) {
+    if (!widget.enabled || _listening || _voiceBusy) return;
+    _fingerDown = true;
+    _activePointer = e.pointer;
+    _longPressTimer?.cancel();
+    _longPressTimer = Timer(const Duration(milliseconds: 480), () {
+      if (!mounted || !_fingerDown || _activePointer == null) return;
+      unawaited(CrashLogService.instance.log('voice', 'longPress fired'));
+      unawaited(_startSafeVoice());
+    });
+  }
+
+  void _onPointerUpOrCancel(PointerEvent e) {
+    if (_activePointer != null && e.pointer != _activePointer) return;
+    _fingerDown = false;
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    _activePointer = null;
+    // Intent 语音由系统界面接管，松手不再 stop（避免误取消）
+  }
+
+  @override
+  void dispose() {
+    _longPressTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final enabled = widget.enabled;
+    // 给系统底部手势条留出空间，避免输入栏盖住 Home 上滑区域
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
+    return Material(
+      elevation: 6,
+      shadowColor: Colors.black26,
+      color: scheme.surface,
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(10, 10, 10, 10 + bottomInset),
+        child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              IconButton.filledTonal(
+                tooltip: '发送图片到 PC',
+                onPressed: enabled ? widget.onPickImage : null,
+                style: IconButton.styleFrom(
+                  fixedSize: const Size(44, 44),
+                  minimumSize: const Size(44, 44),
+                  maximumSize: const Size(44, 44),
+                  padding: EdgeInsets.zero,
+                  shape: const CircleBorder(),
+                ),
+                icon: const Icon(Icons.add_photo_alternate_outlined),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: enabled ? _onPointerDown : null,
+                  onPointerUp: _onPointerUpOrCancel,
+                  onPointerCancel: _onPointerUpOrCancel,
+                  child: TextField(
+                    controller: widget.controller,
+                    focusNode: widget.focusNode,
+                    minLines: 1,
+                    maxLines: 6,
+                    enabled: enabled,
+                    // 录音中只读，避免安卓10选区/输入法与语音冲突闪退
+                    readOnly: _listening,
+                    enableInteractiveSelection: !_listening,
+                    contextMenuBuilder: _listening
+                        ? (context, editableTextState) =>
+                            const SizedBox.shrink()
+                        : null,
+                    textInputAction: TextInputAction.newline,
+                    keyboardType: TextInputType.multiline,
+                    textCapitalization: TextCapitalization.sentences,
+                    style: Theme.of(context).textTheme.bodyLarge,
+                    decoration: InputDecoration(
+                      hintText: _hint,
+                      filled: true,
+                      fillColor: _listening
+                          ? scheme.primaryContainer.withValues(alpha: 0.55)
+                          : enabled
+                              ? scheme.surfaceContainerHighest.withValues(
+                                  alpha: 0.72,
+                                )
+                              : scheme.surfaceContainerHighest.withValues(
+                                  alpha: 0.35,
+                                ),
+                      prefixIcon: _listening
+                          ? Icon(Icons.mic, color: scheme.primary)
+                          : null,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide.none,
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide.none,
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide(
+                          color: scheme.primary.withValues(alpha: 0.45),
+                          width: 1.5,
+                        ),
+                      ),
+                      disabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(22),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              AnimatedOpacity(
+                opacity: widget.canSend || widget.sending ? 1 : 0.45,
+                duration: const Duration(milliseconds: 160),
+                child: IconButton.filled(
+                  tooltip: '发送',
+                  onPressed: widget.canSend ? widget.onSend : null,
+                  style: IconButton.styleFrom(
+                    minimumSize: const Size(48, 48),
+                  ),
+                  icon: widget.sending
+                      ? SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.2,
+                            color: scheme.onPrimary,
+                          ),
+                        )
+                      : const Icon(Icons.send_rounded),
+                ),
+              ),
+            ],
+          ),
+        ),
+    );
+  }
+}
+
+class _MessageBubble extends StatefulWidget {
+  const _MessageBubble({
+    super.key,
+    required this.message,
+    required this.statusHint,
+  });
+
+  final PromptJob message;
+  final String statusHint;
+
+  @override
+  State<_MessageBubble> createState() => _MessageBubbleState();
+}
+
+class _MessageBubbleState extends State<_MessageBubble>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => widget.message.attachment != null;
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    final message = widget.message;
+    final statusHint = widget.statusHint;
+    final scheme = Theme.of(context).colorScheme;
+    final hasResult =
+        message.result != null && message.result!.trim().isNotEmpty;
+    final attachment = message.attachment;
+    final fromPc = attachment != null && !attachment.isToAgent;
+    final toAgent = attachment?.isToAgent == true;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Align(
+            alignment:
+                fromPc ? Alignment.centerLeft : Alignment.centerRight,
+            child: GestureDetector(
+              onLongPress: fromPc
+                  ? null
+                  : () async {
+                      final text = message.content.trim();
+                      if (text.isEmpty) return;
+                      await Clipboard.setData(ClipboardData(text: text));
+                      if (!context.mounted) return;
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('已复制用户消息'),
+                          duration: Duration(seconds: 1),
+                        ),
+                      );
+                    },
+              child: Container(
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.of(context).size.width * 0.82,
+                ),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: fromPc
+                      ? scheme.secondaryContainer
+                      : scheme.primaryContainer,
+                  borderRadius: BorderRadius.only(
+                    topLeft: const Radius.circular(14),
+                    topRight: const Radius.circular(14),
+                    bottomLeft: Radius.circular(fromPc ? 4 : 14),
+                    bottomRight: Radius.circular(fromPc ? 14 : 4),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(message.content),
+                    const SizedBox(height: 4),
+                    Text(
+                      statusHint,
+                      style: Theme.of(context).textTheme.labelSmall,
+                    ),
+                    if (fromPc) ...[
+                      const SizedBox(height: 8),
+                      _FileDownloadButton(attachment: attachment!),
+                    ],
+                    if (toAgent && attachment != null) ...[
+                      const SizedBox(height: 8),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            attachment.isImage
+                                ? Icons.image
+                                : Icons.attach_file,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 6),
+                          Flexible(
+                            child: Text(
+                              '已发送到 PC：${attachment.fileName}',
+                              style: Theme.of(context).textTheme.labelMedium,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+          if (hasResult && !fromPc) ...[
+            const SizedBox(height: 6),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Container(
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.of(context).size.width * 0.88,
+                ),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest,
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(14),
+                    topRight: Radius.circular(14),
+                    bottomRight: Radius.circular(14),
+                  ),
+                ),
+                child: LinkifiedText(message.result!),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _FileDownloadButton extends StatelessWidget {
+  const _FileDownloadButton({required this.attachment});
+
+  final FileAttachment attachment;
+
+  String _mimeForPath(String path) {
+    final lower = path.toLowerCase();
+    if (lower.endsWith('.apk')) {
+      return 'application/vnd.android.package-archive';
+    }
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.pdf')) return 'application/pdf';
+    if (lower.endsWith('.txt') ||
+        lower.endsWith('.log') ||
+        lower.endsWith('.md')) {
+      return 'text/plain';
+    }
+    if (lower.endsWith('.zip')) return 'application/zip';
+    if (lower.endsWith('.json')) return 'application/json';
+    return attachment.mimeType?.trim().isNotEmpty == true
+        ? attachment.mimeType!.trim()
+        : '*/*';
+  }
+
+  Future<void> _ensureCanInstallApk(BuildContext context) async {
+    if (!Platform.isAndroid) return;
+    final status = await Permission.requestInstallPackages.status;
+    if (status.isGranted) return;
+    final req = await Permission.requestInstallPackages.request();
+    if (!req.isGranted && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请允许「安装未知应用」后再打开 APK')),
+      );
+      await openAppSettings();
+    }
+  }
+
+  Future<void> _openSaved(BuildContext context, String path) async {
+    if (!await File(path).exists()) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('文件不存在，请重新下载')),
+      );
+      return;
+    }
+
+    final mime = _mimeForPath(path);
+    if (path.toLowerCase().endsWith('.apk')) {
+      await _ensureCanInstallApk(context);
+    }
+
+    final result = await OpenFilex.open(path, type: mime);
+    if (!context.mounted) return;
+    if (result.type == ResultType.done) return;
+
+    try {
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(path, mimeType: mime)],
+          text: attachment.fileName,
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('无法打开：${result.message}；$e')),
+      );
+    }
+  }
+
+  Future<void> _shareSaved(String path) async {
+    final mime = _mimeForPath(path);
+    await SharePlus.instance.share(
+      ShareParams(
+        files: [XFile(path, mimeType: mime)],
+        text: attachment.fileName,
+      ),
+    );
+  }
+
+  Future<void> _copyPath(BuildContext context, String path) async {
+    await Clipboard.setData(ClipboardData(text: path));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('路径已复制')),
+    );
+  }
+
+  Future<void> _download(BuildContext context) async {
+    final state = context.read<AppState>();
+    final result = await state.downloadAttachmentFile(
+      fileId: attachment.id,
+      fileName: attachment.fileName,
+    );
+    if (!context.mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    if (result.status == AttachmentDownloadStatus.done) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('下载完成'),
+          duration: Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          margin: EdgeInsets.only(left: 12, right: 12, bottom: 88),
+        ),
+      );
+    } else if (result.status == AttachmentDownloadStatus.failed) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('下载失败：${result.error ?? ""}'),
+          duration: const Duration(seconds: 3),
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.only(left: 12, right: 12, bottom: 88),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dl = context.select<AppState, AttachmentDownloadState?>(
+      (s) => s.attachmentDownloadOf(attachment.id),
+    );
+    final busy = dl?.isBusy == true;
+    final savedPath = dl?.savedPath;
+    final size = attachment.size;
+    final sizeLabel = size >= 1024 * 1024
+        ? '${(size / (1024 * 1024)).toStringAsFixed(1)} MB'
+        : '${(size / 1024).ceil()} KB';
+    final scheme = Theme.of(context).colorScheme;
+    final isApk = attachment.fileName.toLowerCase().endsWith('.apk');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        FilledButton.tonalIcon(
+          onPressed: busy ? null : () => _download(context),
+          icon: busy
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.download),
+          label: Text(
+            busy
+                ? '下载中 ${attachment.fileName}…'
+                : (savedPath == null
+                    ? '下载 ${attachment.fileName}（$sizeLabel）'
+                    : '重新下载 ${attachment.fileName}'),
+          ),
+        ),
+        if (savedPath != null) ...[
+          const SizedBox(height: 8),
+          FilledButton.icon(
+            onPressed: () => _openSaved(context, savedPath),
+            icon: Icon(isApk ? Icons.android : Icons.open_in_new),
+            label: Text(isApk ? '打开 / 安装 APK' : '打开已下载文件'),
+          ),
+          const SizedBox(height: 6),
+          OutlinedButton.icon(
+            onPressed: () => _shareSaved(savedPath),
+            icon: const Icon(Icons.share_outlined),
+            label: const Text('分享到其他应用打开'),
+          ),
+          const SizedBox(height: 6),
+          Material(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+            borderRadius: BorderRadius.circular(10),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: () => _openSaved(context, savedPath),
+              onLongPress: () => _copyPath(context, savedPath),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.link, size: 16, color: scheme.primary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        savedPath,
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                              color: scheme.primary,
+                              decoration: TextDecoration.underline,
+                            ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Text(
+            '点路径可打开；长按复制。APK 需允许「安装未知应用」',
+            style: Theme.of(context).textTheme.labelSmall,
+          ),
+        ],
+      ],
+    );
+  }
+}

@@ -25,10 +25,44 @@ class ApiClient {
     return Uri.parse('$normalized$path').replace(queryParameters: query);
   }
 
+  /// Node 中继直接返回数组；RuoYi 失败时常 HTTP200 + `{code,msg,data}`。
+  List<dynamic> _asList(String body) {
+    final decoded = jsonDecode(body);
+    if (decoded is List) return decoded;
+    if (decoded is Map) {
+      final map = Map<String, dynamic>.from(decoded);
+      final code = map['code'];
+      if (code != null && code != 200 && code != '200') {
+        throw Exception(map['msg']?.toString() ?? '请求失败($code)');
+      }
+      final data = map['data'];
+      if (data is List) return data;
+      final rows = map['rows'];
+      if (rows is List) return rows;
+      throw Exception(map['msg']?.toString() ?? '接口返回不是列表');
+    }
+    throw Exception('接口返回不是列表');
+  }
+
+  Map<String, dynamic> _asMap(String body) {
+    final decoded = jsonDecode(body);
+    if (decoded is Map) {
+      final map = Map<String, dynamic>.from(decoded);
+      final code = map['code'];
+      if (code != null && code != 200 && code != '200' && map.containsKey('msg')) {
+        throw Exception(map['msg']?.toString() ?? '请求失败($code)');
+      }
+      final data = map['data'];
+      if (data is Map) return Map<String, dynamic>.from(data);
+      return map;
+    }
+    throw Exception('接口返回不是对象');
+  }
+
   Future<List<Project>> listProjects() async {
     final res = await http.get(_uri('/api/projects'), headers: _headers);
     _ensureOk(res);
-    final list = jsonDecode(res.body) as List<dynamic>;
+    final list = _asList(res.body);
     return list
         .map((e) => Project.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -69,7 +103,7 @@ class ApiClient {
       headers: _headers,
     );
     _ensureOk(res);
-    final list = jsonDecode(res.body) as List<dynamic>;
+    final list = _asList(res.body);
     return list
         .map((e) => TaskEvent.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -100,7 +134,7 @@ class ApiClient {
       headers: _headers,
     );
     _ensureOk(res);
-    final list = jsonDecode(res.body) as List<dynamic>;
+    final list = _asList(res.body);
     return list
         .map((e) => ChatSession.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -155,7 +189,7 @@ class ApiClient {
       headers: _headers,
     );
     _ensureOk(res);
-    final list = jsonDecode(res.body) as List<dynamic>;
+    final list = _asList(res.body);
     return list
         .map((e) => PromptJob.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -167,7 +201,7 @@ class ApiClient {
       headers: _headers,
     );
     _ensureOk(res);
-    final list = jsonDecode(res.body) as List<dynamic>;
+    final list = _asList(res.body);
     return list
         .map((e) => PromptJob.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -196,7 +230,7 @@ class ApiClient {
     final res =
         await http.get(_uri('/api/session-contexts'), headers: _headers);
     _ensureOk(res);
-    final list = jsonDecode(res.body) as List<dynamic>;
+    final list = _asList(res.body);
     return list
         .map((e) => SessionContext.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -246,7 +280,7 @@ class ApiClient {
   Future<List<Map<String, dynamic>>> listPairedDevices() async {
     final res = await http.get(_uri('/pair/devices'), headers: _authHeaders);
     _ensureOk(res);
-    final list = jsonDecode(res.body) as List<dynamic>;
+    final list = _asList(res.body);
     return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 

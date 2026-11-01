@@ -31,6 +31,21 @@ function agentMaxTimeoutMs(): number {
   return envMs("CODEASSIST_AGENT_TIMEOUT_MS", DEFAULT_MAX_TIMEOUT_MS, 60_000);
 }
 
+/** 可自动重试/切备用引擎的失败（绝对上限超时不重试，避免拖死队列） */
+function isRetryableAgentFailure(text: string): boolean {
+  if (!text.startsWith("[agent-error]")) return false;
+  if (text.includes("绝对上限")) return false;
+  if (/未找到 Cursor Agent CLI|未找到 Codex CLI/i.test(text)) return false;
+  return (
+    /agent exited \d+/i.test(text) ||
+    /codex exited \d+/i.test(text) ||
+    /exit=\d+/i.test(text) ||
+    /ownership is currently changing/i.test(text) ||
+    /ENOTFOUND|ECONNRESET|ETIMEDOUT|ECONNREFUSED|unavailable/i.test(text) ||
+    /空闲超时/i.test(text)
+  );
+}
+
 function killProcessTree(child: ChildProcess) {
   const pid = child.pid;
   if (!pid) return;
@@ -84,7 +99,6 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
 
     ws.on("open", () => {
       console.error("[codeassist-mcp] live-pull connected (phone→PC→结果回传)");
-      const projectId = opts.getProjectId();
       // 订阅全部事件：除本项目 prompt 外，还需收到 project.open
       ws?.send(JSON.stringify({ type: "subscribe" }));
       // 重连后把积压的 queued 排空
@@ -106,8 +120,12 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
       }
     });
 
-    ws.on("error", () => {
-      /* close retries */
+    ws.on("error", (err) => {
+      // 云端 nginx 常丢 Upgrade → WS 失败；靠下方 HTTP 轮询兜底，勿静默吞掉
+      console.error(
+        "[codeassist-mcp] live-pull ws error (will retry; HTTP poll still active):",
+        err instanceof Error ? err.message : err,
+      );
     });
   };
 
@@ -286,14 +304,32 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
             .catch(() => undefined);
         };
         try {
-          const runAgent =
+          const raceAgent = (
+            run: () => Promise<AgentRunResult>,
+          ): Promise<AgentRunResult> => {
+            if (hardTimer) clearTimeout(hardTimer);
+            return Promise.race([
+              run().finally(() => {
+                if (hardTimer) clearTimeout(hardTimer);
+              }),
+              new Promise<AgentRunResult>((resolve) => {
+                hardTimer = setTimeout(() => {
+                  resolve({
+                    text: `[agent-error] 执行超过绝对上限(${Math.round(maxMs / 1000)}s)，已中止以免阻塞后续手机指令`,
+                  });
+                }, maxMs + 20_000);
+              }),
+            ]);
+          };
+
+          const runPrimary = (resume?: string) =>
             ide === "codex"
               ? () =>
                   runCodexAgent(
                     opts.getWorkspace(),
                     enrichedContents,
                     prompts.map((p) => p.id),
-                    resumeChatId,
+                    resume,
                     idleMs,
                     maxMs,
                     heartbeat,
@@ -303,23 +339,53 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                     opts.getWorkspace(),
                     enrichedContents,
                     prompts.map((p) => p.id),
-                    resumeChatId,
+                    resume,
                     idleMs,
                     maxMs,
                     heartbeat,
                   );
-          agentResult = await Promise.race([
-            runAgent().finally(() => {
-              if (hardTimer) clearTimeout(hardTimer);
-            }),
-            new Promise<AgentRunResult>((resolve) => {
-              hardTimer = setTimeout(() => {
-                resolve({
-                  text: `[agent-error] 执行超过绝对上限(${Math.round(maxMs / 1000)}s)，已中止以免阻塞后续手机指令`,
-                });
-              }, maxMs + 20_000);
-            }),
-          ]);
+
+          agentResult = await raceAgent(runPrimary(resumeChatId));
+
+          // 备用1：瞬时失败（空输出 exit、会话锁、网络）→ 丢弃 resume 再跑一轮
+          if (isRetryableAgentFailure(agentResult.text)) {
+            console.error(
+              `[codeassist-mcp] ${ideLabel} 首次失败，清空 session 后自动重试一次：${agentResult.text.slice(0, 160)}`,
+            );
+            notifyToast(`CodeAssist：${ideLabel} 失败，自动重试…`);
+            if (chatSessionId) {
+              await api
+                .updateChatSession(chatSessionId, { cursorChatId: "" })
+                .catch(() => undefined);
+            }
+            agentResult = await raceAgent(runPrimary(undefined));
+          }
+
+          // 备用2：Cursor 仍失败时，若本机有 Codex CLI 则切换 Codex 再跑
+          const allowCodexFallback =
+            process.env.CODEASSIST_FALLBACK_CODEX !== "0";
+          if (
+            ide === "cursor" &&
+            allowCodexFallback &&
+            isRetryableAgentFailure(agentResult.text) &&
+            findCodexCmd()
+          ) {
+            console.error(
+              `[codeassist-mcp] Cursor 仍失败，备用切换 Codex：${agentResult.text.slice(0, 160)}`,
+            );
+            notifyToast("CodeAssist：Cursor 失败，改用 Codex 执行…");
+            agentResult = await raceAgent(() =>
+              runCodexAgent(
+                opts.getWorkspace(),
+                enrichedContents,
+                prompts.map((p) => p.id),
+                undefined,
+                idleMs,
+                maxMs,
+                heartbeat,
+              ),
+            );
+          }
         } catch (err) {
           if (hardTimer) clearTimeout(hardTimer);
           agentResult = {
@@ -335,7 +401,11 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
             .catch(() => undefined);
         }
 
-        const resultText = agentResult.text;
+        let resultText = agentResult.text;
+        if (resultText === "[agent-error] agent exited 1") {
+          resultText =
+            "[agent-error] agent exited 1（Cursor Agent 无输出退出）。常见原因：会话 resume 损坏、Cursor API 瞬时失败、Agent 进程崩溃。已尝试自动重试/备用引擎；仍失败请保持 Cursor 打开本项目（走 MCP 人工回合），或重登 agent status。";
+        }
         const ok = !resultText.startsWith("[agent-error]");
         const summary = truncate(resultText, 3500);
 
@@ -395,8 +465,23 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
   }
 
   connect();
+
+  // HTTP 轮询兜底：WS 在部分网关（如未配置 Upgrade 的 nginx）会一直连不上，
+  // 仅靠 WS open/message 时永远不会 drainQueue，手机端就会一直「排队等待」。
+  const pollMs = Number(process.env.CODEASSIST_POLL_MS ?? 3000);
+  const pollEvery = Number.isFinite(pollMs) && pollMs >= 1000 ? pollMs : 3000;
+  console.error(
+    `[codeassist-mcp] live-pull HTTP poll every ${pollEvery}ms (WS + poll)`,
+  );
+  const pollTimer = setInterval(() => {
+    if (closed || draining) return;
+    void drainQueue();
+    void drainOpenWorkspace();
+  }, pollEvery);
+
   return () => {
     closed = true;
+    clearInterval(pollTimer);
     if (retryTimer) clearTimeout(retryTimer);
     ws?.close();
   };

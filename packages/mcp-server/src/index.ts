@@ -19,6 +19,50 @@ const POLL_MS = Number(process.env.CODEASSIST_POLL_MS ?? 3000);
 
 const api = new ApiClient(SERVER_URL, TOKEN);
 
+const MCP_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const DEVICE_ENV_FILE = path.resolve(MCP_ROOT, "..", ".codeassist-device.env");
+
+function isLocalRelayUrl(url: string): boolean {
+  const u = String(url || "").replace(/\/$/, "");
+  return (
+    /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/i.test(u) ||
+    /^https?:\/\/192\.168\.\d+\.\d+/i.test(u) ||
+    /^https?:\/\/10\.\d+\.\d+\.\d+/i.test(u)
+  );
+}
+
+function loadDeviceEnvFile(filePath: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!fs.existsSync(filePath)) return out;
+  try {
+    const text = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const i = line.indexOf("=");
+      if (i <= 0) continue;
+      const key = line.slice(0, i).trim();
+      const val = line.slice(i + 1).trim();
+      if (key) out[key] = val;
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
+/** 若本机已配对云端中继，则返回云端 ApiClient（与本地 MCP 双通道）。 */
+function cloudPeerApi(): ApiClient | null {
+  const env = loadDeviceEnvFile(DEVICE_ENV_FILE);
+  const url = String(env.CODEASSIST_SERVER_URL || "")
+    .trim()
+    .replace(/\/$/, "");
+  const token = String(env.CODEASSIST_TOKEN || "").trim();
+  if (!url || !token || isLocalRelayUrl(url)) return null;
+  if (url === SERVER_URL && token === TOKEN) return null;
+  return new ApiClient(url, token);
+}
+
 let project: Project | null = null;
 let cachedPrompts: PromptDelivery[] = [];
 let cachedDecisions: Decision[] = [];
@@ -456,14 +500,47 @@ server.tool(
       };
     }
     const contentBase64 = fs.readFileSync(absolute).toString("base64");
-    const created = await api.createFileTransfer({
+    const fileName = path.basename(absolute);
+    const payload = {
       projectId: p.id,
       chatSessionId,
-      fileName: path.basename(absolute),
+      fileName,
       mimeType,
       contentBase64,
-      direction: "to_client",
-    });
+      direction: "to_client" as const,
+    };
+    const created = await api.createFileTransfer(payload);
+
+    // 手机切到云端时连的是 mcp-x，不是本地 :8787；同步再发一份到云端配对中继
+    let cloud: { ok: true; fileId: string } | { ok: false; error: string } | null =
+      null;
+    const peer = cloudPeerApi();
+    if (peer) {
+      try {
+        const cloudCreated = await peer.createFileTransfer({
+          projectId: p.id,
+          // 云端会话 id 与本地不同，交给服务端选最新会话
+          fileName,
+          mimeType,
+          contentBase64,
+          direction: "to_client",
+        });
+        cloud = { ok: true, fileId: cloudCreated.file.id };
+      } catch (err) {
+        cloud = {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+
+    const cloudNote =
+      cloud == null
+        ? "（未配置云端配对，仅发到当前 MCP 中继）"
+        : cloud.ok
+          ? "（已同步发到云端，云端手机可下载）"
+          : `（云端同步失败：${cloud.error}；局域网仍可用）`;
+
     return {
       content: [
         {
@@ -473,7 +550,8 @@ server.tool(
               ok: true,
               file: created.file,
               promptId: created.prompt.id,
-              message: `已发送到手机对话：${created.file.fileName}`,
+              cloud,
+              message: `已发送到手机对话：${created.file.fileName}${cloudNote}`,
             },
             null,
             2,

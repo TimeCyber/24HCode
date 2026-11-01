@@ -115,7 +115,8 @@ export type CreateChatSessionRequest = z.infer<
 
 export const UpdateChatSessionRequestSchema = z.object({
   title: z.string().min(1).optional(),
-  cursorChatId: z.string().min(1).optional(),
+  /** 传空字符串可清空坏掉的 resume session，强制下次新开对话 */
+  cursorChatId: z.string().optional(),
   contextSummary: z.string().optional(),
   contextStep: z.string().optional(),
   contextStatus: z.string().optional(),

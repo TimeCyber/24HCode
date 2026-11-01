@@ -14,8 +14,10 @@ class SetupScreen extends StatefulWidget {
 }
 
 class _SetupScreenState extends State<SetupScreen> {
+  /// 云端固定网关；有网登录不可改服务地址
+  static const String _cloudApiRoot = 'https://mcp-x.com/prod-api';
+
   late bool _lanMode;
-  late final TextEditingController _root;
   late final TextEditingController _phone;
   late final TextEditingController _sms;
   late final TextEditingController _lanUrl;
@@ -31,11 +33,6 @@ class _SetupScreenState extends State<SetupScreen> {
     super.initState();
     final state = context.read<AppState>();
     _lanMode = state.isLanMode;
-    _root = TextEditingController(
-      text: state.apiRoot.isNotEmpty
-          ? state.apiRoot
-          : 'https://mcp-x.com/prod-api',
-    );
     _phone = TextEditingController(
       text: RegExp(r'^1\d{10}$').hasMatch(state.username) ? state.username : '',
     );
@@ -55,7 +52,6 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   void dispose() {
     _smsTimer?.cancel();
-    _root.dispose();
     _phone.dispose();
     _sms.dispose();
     _lanUrl.dispose();
@@ -81,18 +77,13 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _sendSms() async {
-    final root = _root.text.trim();
     final phone = _phone.text.trim();
-    if (root.isEmpty || phone.isEmpty) {
-      setState(() => _error = '请填写服务地址和手机号');
+    if (phone.isEmpty) {
+      setState(() => _error = '请填写手机号');
       return;
     }
     if (!RegExp(r'^1\d{10}$').hasMatch(phone)) {
       setState(() => _error = '请输入11位中国大陆手机号');
-      return;
-    }
-    if (!(root.startsWith('http://') || root.startsWith('https://'))) {
-      setState(() => _error = '地址需以 http:// 或 https:// 开头');
       return;
     }
     if (_smsCooldown > 0 || _sendingSms) return;
@@ -102,7 +93,9 @@ class _SetupScreenState extends State<SetupScreen> {
       _error = null;
     });
     try {
-      await context.read<AppState>().sendSmsCode(root: root, phoneNumber: phone);
+      await context
+          .read<AppState>()
+          .sendSmsCode(root: _cloudApiRoot, phoneNumber: phone);
       if (!mounted) return;
       _startSmsCooldown();
       ScaffoldMessenger.of(context).showSnackBar(
@@ -116,19 +109,14 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _loginCloud() async {
-    final root = _root.text.trim();
     final phone = _phone.text.trim();
     final sms = _sms.text.trim();
-    if (root.isEmpty || phone.isEmpty || sms.isEmpty) {
-      setState(() => _error = '请填写服务地址、手机号和短信验证码');
+    if (phone.isEmpty || sms.isEmpty) {
+      setState(() => _error = '请填写手机号和短信验证码');
       return;
     }
     if (!RegExp(r'^1\d{10}$').hasMatch(phone)) {
       setState(() => _error = '请输入11位中国大陆手机号');
-      return;
-    }
-    if (!(root.startsWith('http://') || root.startsWith('https://'))) {
-      setState(() => _error = '地址需以 http:// 或 https:// 开头');
       return;
     }
 
@@ -138,7 +126,7 @@ class _SetupScreenState extends State<SetupScreen> {
     });
     try {
       await context.read<AppState>().login(
-            root: root,
+            root: _cloudApiRoot,
             phoneNumber: phone,
             smsCode: sms,
           );
@@ -303,9 +291,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       '· Token 与电脑端 ACCESS_TOKEN 一致（默认 codeassist-dev-token）\n'
                       '· 手机与电脑需同一 Wi‑Fi，且防火墙放行 8787'
                   : '云端说明：\n'
-                      '· 发送验证码：{服务地址}/web/auth/sms/send-code\n'
-                      '· 短信登录：{服务地址}/web/auth/sms/login\n'
-                      '· 中继接口：{服务地址}/codeassist/api/...\n'
+                      '· 服务固定：https://mcp-x.com/prod-api（不可修改）\n'
                       '· 登录后到「设备配对」生成配对码绑定家里电脑',
               style: Theme.of(context).textTheme.bodySmall,
             ),
@@ -318,18 +304,6 @@ class _SetupScreenState extends State<SetupScreen> {
   List<Widget> _cloudFields(BuildContext context) {
     final canSend = !_sendingSms && _smsCooldown == 0;
     return [
-      TextField(
-        controller: _root,
-        decoration: const InputDecoration(
-          labelText: '服务地址（API 根）',
-          hintText: 'https://mcp-x.com/prod-api',
-          helperText: 'RuoYi 网关；中继自动使用 /codeassist',
-          border: OutlineInputBorder(),
-        ),
-        keyboardType: TextInputType.url,
-        autocorrect: false,
-      ),
-      const SizedBox(height: 16),
       TextField(
         controller: _phone,
         decoration: const InputDecoration(

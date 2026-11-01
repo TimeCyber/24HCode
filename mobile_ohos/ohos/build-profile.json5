@@ -1,0 +1,54 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "storeFile": "D:/yixiu/yixiu.p12",
+          "storePassword": "0000001B5238FDA4F11AB559102B86E1A340E2AFD57B7460F04BD98AA0C902543B08F511D80109F37BF15F",
+          "keyAlias": "yixiu",
+          "keyPassword": "0000001B3F9D84BCAC912F23BF323FE2E6E69AF776B72ECA0017FA2BB3408503450784EC4DC3D09048E7C4",
+          "signAlg": "SHA256withECDSA",
+          "profile": "D:/androidproject/CodeAssit/mobile_ohos/profile_release.p7b",
+          "certpath": "D:/yixiu/yixiu-release.cer"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "compileSdkVersion": "6.1.1(24)",
+        "targetSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS",
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "profile"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "CodeAssist 鸿蒙客户端"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "CodeAssist"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "CodeAssist"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "用于语音输入转文字（后续版本）"
+    }
+  ]
+}

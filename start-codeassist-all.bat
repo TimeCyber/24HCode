@@ -25,6 +25,9 @@ if exist "packages\mcp-server\.codeassist-device.env" (
   )
 )
 
+REM 开机后稍等，等网卡/磁盘就绪
+timeout /t 20 /nobreak >nul
+
 echo [codeassist] start-all %DATE% %TIME%
 "C:\nvm4w\nodejs\node.exe" "D:\androidproject\CodeAssit\scripts\start-relay.mjs" >> "D:\androidproject\CodeAssit\packages\mcp-server\start-all.log" 2>&1
 exit /b %ERRORLEVEL%

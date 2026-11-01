@@ -519,7 +519,9 @@ export class Store {
     const now = nowIso();
     const title = input.title?.trim() || existing.title;
     const cursorChatId =
-      input.cursorChatId?.trim() || existing.cursorChatId || null;
+      input.cursorChatId !== undefined
+        ? input.cursorChatId.trim() || null
+        : existing.cursorChatId || null;
     const contextSummary =
       input.contextSummary !== undefined
         ? input.contextSummary

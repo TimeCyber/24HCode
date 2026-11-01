@@ -344,9 +344,26 @@ class AppState extends ChangeNotifier {
   Future<void> refreshAll() async {
     final api = _api;
     if (api == null) return;
-    projects = _dedupeProjects(await api.listProjects());
-    tasks = await api.listTasks();
-    sessions = await api.listSessionContexts();
+    final errors = <String>[];
+    try {
+      projects = _dedupeProjects(await api.listProjects());
+    } catch (e) {
+      projects = [];
+      errors.add('项目: $e');
+    }
+    try {
+      tasks = await api.listTasks();
+    } catch (e) {
+      tasks = [];
+      errors.add('任务: $e');
+    }
+    try {
+      sessions = await api.listSessionContexts();
+    } catch (e) {
+      sessions = [];
+      // 会话上下文失败不阻断首页（云端缺表时曾整页崩溃）
+      errors.add('会话上下文: $e');
+    }
 
     if (activeProjectId == null ||
         !projects.any((p) => p.id == activeProjectId)) {
@@ -359,6 +376,10 @@ class AppState extends ChangeNotifier {
     await _loadChatSessionsForActiveProject();
     await _loadMessagesForActiveChat();
     await _persistSelection();
+    // 仅当项目都拉失败时把错误顶到首页；上下文缺表只记日志不挡操作
+    error = errors.isNotEmpty && projects.isEmpty
+        ? errors.join('\n')
+        : null;
     notifyListeners();
   }
 

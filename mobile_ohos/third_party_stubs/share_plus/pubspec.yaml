@@ -1,0 +1,10 @@
+name: share_plus
+description: OHOS stub
+version: 1.0.0+stub
+publish_to: none
+environment:
+  sdk: ">=3.9.0 <4.0.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  cross_file: ^0.3.4

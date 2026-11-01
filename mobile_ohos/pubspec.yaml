@@ -1,0 +1,36 @@
+name: codeassist_ohos
+description: CodeAssist 鸿蒙客户端（Flutter-OH）
+publish_to: "none"
+version: 1.0.0+100
+
+environment:
+  sdk: ">=3.9.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  cross_file: ^0.3.4
+  http: ^1.2.2
+  provider: ^6.1.2
+  shared_preferences: ^2.3.3
+  path_provider: ^2.1.4
+  web_socket_channel: ^3.0.1
+  url_launcher: ^6.3.1
+  # 下列为本地 stub，保证编译通过；能力在鸿蒙侧逐步补齐
+  image_picker:
+    path: third_party_stubs/image_picker
+  open_filex:
+    path: third_party_stubs/open_filex
+  permission_handler:
+    path: third_party_stubs/permission_handler
+  share_plus:
+    path: third_party_stubs/share_plus
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
