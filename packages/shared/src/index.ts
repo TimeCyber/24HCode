@@ -249,6 +249,49 @@ export type SyncSessionContextRequest = z.infer<
   typeof SyncSessionContextRequestSchema
 >;
 
+/** A Codex account's current usage windows, reported by the local Codex CLI. */
+export const CodexUsageWindowSchema = z.object({
+  usedPercent: z.number().int().min(0).max(100),
+  windowDurationMins: z.number().int().positive(),
+  resetsAt: z.number().int().positive().optional(),
+});
+export type CodexUsageWindow = z.infer<typeof CodexUsageWindowSchema>;
+
+export const CodexUsageSnapshotSchema = z.object({
+  projectId: z.string().min(1),
+  planType: z.string().max(40).optional(),
+  primary: CodexUsageWindowSchema.nullable().optional(),
+  secondary: CodexUsageWindowSchema.nullable().optional(),
+  updatedAt: z.string(),
+});
+export type CodexUsageSnapshot = z.infer<typeof CodexUsageSnapshotSchema>;
+
+/** A local Codex thread that can be selected by the mobile client to continue. */
+export const CodexDesktopSessionSchema = z.object({
+  id: z.string().min(1).max(160),
+  title: z.string().min(1).max(100),
+  preview: z.string().max(240).optional(),
+  source: z.string().max(40).default("unknown"),
+  updatedAt: z.number().int().nonnegative(),
+});
+export type CodexDesktopSession = z.infer<typeof CodexDesktopSessionSchema>;
+
+export const SyncCodexDesktopSessionsRequestSchema = z.object({
+  sessions: z.array(CodexDesktopSessionSchema).max(500),
+});
+export type SyncCodexDesktopSessionsRequest = z.infer<
+  typeof SyncCodexDesktopSessionsRequestSchema
+>;
+
+export const SyncCodexUsageRequestSchema = z.object({
+  planType: z.string().max(40).optional(),
+  primary: CodexUsageWindowSchema.nullable().optional(),
+  secondary: CodexUsageWindowSchema.nullable().optional(),
+});
+export type SyncCodexUsageRequest = z.infer<
+  typeof SyncCodexUsageRequestSchema
+>;
+
 export const OpenWorkspaceRequestSchema = z.object({
   workspacePath: z.string().min(1),
   ide: IdeSchema.default("cursor"),
@@ -279,6 +322,7 @@ export const WsEventTypeSchema = z.enum([
   "project.open",
   "decision.created",
   "session.updated",
+  "codex.usage.updated",
   "chat.session.updated",
   "chat.session.deleted",
   "file.created",

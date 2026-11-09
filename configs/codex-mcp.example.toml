@@ -6,8 +6,12 @@ command = 'C:\nvm4w\nodejs\node.exe'
 args = ["D:/androidproject/CodeAssit/packages/mcp-server/run.mjs"]
 
 [mcp_servers.codeassist.env]
-CODEASSIST_SERVER_URL = "http://127.0.0.1:8787"
-CODEASSIST_TOKEN = "codeassist-dev-token"
+# If unset, run.mjs loads the paired cloud URL/device token as a pair.
+# For a local relay, set both values explicitly; they take precedence over the pair file.
+# The phone account login token does not belong in this configuration.
+# CODEASSIST_SERVER_URL = "http://127.0.0.1:8787"
+# CODEASSIST_TOKEN = "codeassist-dev-token"
+# 配对后 run.mjs 自动从 packages/mcp-server/.codeassist-device.env 加载云端 URL 和 Token
 CODEASSIST_IDE = "codex"
 CODEASSIST_WORKSPACE = "D:/androidproject/CodeAssit"
 CODEASSIST_MCP_BUILD = "0.3.5-codex"

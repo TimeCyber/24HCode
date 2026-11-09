@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
+import '../models.dart';
 import '../widgets/session_status_sheet.dart';
 import 'crash_log_screen.dart';
 import 'devices_screen.dart';
 import 'prompts_tab.dart';
+import 'scheduled_prompts_screen.dart';
 import 'setup_screen.dart';
 
 class HomeShell extends StatelessWidget {
@@ -43,10 +45,8 @@ class HomeShell extends StatelessWidget {
               message: state.connecting
                   ? '连接中'
                   : (project == null
-                      ? '未选择项目'
-                      : (project.isEffectivelyOnline()
-                          ? '项目在线'
-                          : '项目离线')),
+                        ? '未选择项目'
+                        : (project.isEffectivelyOnline() ? '项目在线' : '项目离线')),
               child: Container(
                 width: 8,
                 height: 8,
@@ -71,22 +71,16 @@ class HomeShell extends StatelessWidget {
               ),
             ),
           IconButton(
+            tooltip: '定时任务',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const ScheduledPromptsScreen()),
+            ),
+            icon: const Icon(Icons.schedule),
+          ),
+          IconButton(
             tooltip: '本会话状态',
             onPressed: () => showSessionStatusSheet(context),
             icon: const Icon(Icons.info_outline),
-          ),
-          IconButton(
-            tooltip: '选择 / 打开项目',
-            onPressed: () {
-              showModalBottomSheet<void>(
-                context: context,
-                isScrollControlled: true,
-                builder: (_) => const _ProjectSheet(),
-              );
-            },
-            icon: Icon(
-              project == null ? Icons.link_off : Icons.folder_outlined,
-            ),
           ),
           IconButton(
             tooltip: '刷新',
@@ -96,14 +90,20 @@ class HomeShell extends StatelessWidget {
           PopupMenuButton<String>(
             tooltip: '更多',
             onSelected: (v) async {
-              if (v == 'crash') {
+              if (v == 'project') {
+                await showModalBottomSheet<void>(
+                  context: context,
+                  isScrollControlled: true,
+                  builder: (_) => const _ProjectSheet(),
+                );
+              } else if (v == 'crash') {
                 Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const CrashLogScreen()),
                 );
               } else if (v == 'setup') {
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const SetupScreen()),
-                );
+                Navigator.of(
+                  context,
+                ).push(MaterialPageRoute(builder: (_) => const SetupScreen()));
               } else if (v == 'devices') {
                 Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const DevicesScreen()),
@@ -111,13 +111,14 @@ class HomeShell extends StatelessWidget {
               } else if (v == 'logout') {
                 await state.logout();
                 if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('已断开连接')),
-                  );
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(const SnackBar(content: Text('已断开连接')));
                 }
               }
             },
             itemBuilder: (_) => [
+              const PopupMenuItem(value: 'project', child: Text('选择 / 打开项目')),
               const PopupMenuItem(value: 'setup', child: Text('连接设置 / 账号')),
               if (!state.isLanMode)
                 const PopupMenuItem(value: 'devices', child: Text('设备配对')),
@@ -142,10 +143,156 @@ class HomeShell extends StatelessWidget {
                 ),
               ],
             ),
+          if (project?.ide == 'codex')
+            _CodexUsageCard(usage: state.activeCodexUsage),
           const Expanded(child: PromptsTab()),
         ],
       ),
     );
+  }
+}
+
+class _CodexUsageCard extends StatelessWidget {
+  const _CodexUsageCard({required this.usage});
+
+  final CodexUsageSnapshot? usage;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final updated = DateTime.tryParse(usage?.updatedAt ?? '')?.toLocal();
+    final stale =
+        updated == null ||
+        DateTime.now().difference(updated) > const Duration(minutes: 10);
+    final plan = usage?.planType;
+
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.data_usage, size: 18),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Codex 额度${plan == null ? '' : ' · ${_planLabel(plan)}'}',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                ),
+                Text(
+                  updated == null
+                      ? '等待同步'
+                      : '${stale ? '数据较旧 · ' : ''}${_clockLabel(updated)}',
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: stale ? colors.error : colors.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+            if (usage == null) ...[
+              const SizedBox(height: 6),
+              Text(
+                '等待电脑端 Codex 同步用量；请确认 Codex CLI 已登录。',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ] else ...[
+              const SizedBox(height: 8),
+              if (usage!.primary != null)
+                _CodexUsageWindowRow(window: usage!.primary!),
+              if (usage!.primary != null && usage!.secondary != null)
+                const SizedBox(height: 8),
+              if (usage!.secondary != null)
+                _CodexUsageWindowRow(window: usage!.secondary!),
+              if (usage!.primary == null && usage!.secondary == null)
+                Text(
+                  '当前没有可展示的额度窗口。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  static String _planLabel(String value) {
+    switch (value.toLowerCase()) {
+      case 'plus':
+        return 'Plus';
+      case 'pro':
+        return 'Pro';
+      case 'team':
+        return 'Team';
+      case 'business':
+        return 'Business';
+      case 'enterprise':
+        return 'Enterprise';
+      default:
+        return value;
+    }
+  }
+
+  static String _clockLabel(DateTime value) =>
+      '${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
+}
+
+class _CodexUsageWindowRow extends StatelessWidget {
+  const _CodexUsageWindowRow({required this.window});
+
+  final CodexUsageWindow window;
+
+  @override
+  Widget build(BuildContext context) {
+    final reset = window.resetsAt == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(
+            window.resetsAt! * 1000,
+          ).toLocal();
+    final resetText = reset == null
+        ? ''
+        : ' · 重置 ${reset.month}/${reset.day} ${reset.hour.toString().padLeft(2, '0')}:${reset.minute.toString().padLeft(2, '0')}';
+    final percent = window.usedPercent.clamp(0, 100);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                _windowLabel(window.windowDurationMins),
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+            Text(
+              '剩余 ${100 - percent}%',
+              style: Theme.of(
+                context,
+              ).textTheme.labelMedium?.copyWith(fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        LinearProgressIndicator(value: percent / 100),
+        const SizedBox(height: 2),
+        Text(
+          '已用 $percent%$resetText',
+          style: Theme.of(context).textTheme.labelSmall,
+        ),
+      ],
+    );
+  }
+
+  static String _windowLabel(int minutes) {
+    if (minutes == 300) return '5 小时窗口';
+    if (minutes == 10080) return '每周窗口';
+    if (minutes % 1440 == 0) return '${minutes ~/ 1440} 天窗口';
+    if (minutes % 60 == 0) return '${minutes ~/ 60} 小时窗口';
+    return '$minutes 分钟窗口';
   }
 }
 
@@ -156,6 +303,8 @@ class _ProjectSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     return Consumer<AppState>(
       builder: (context, s, _) {
+        final visibleProjects = s.visibleProjects;
+        final hiddenProjects = s.hiddenProjects;
         return SafeArea(
           child: SizedBox(
             height: MediaQuery.of(context).size.height * 0.72,
@@ -184,6 +333,14 @@ class _ProjectSheet extends StatelessWidget {
                     ],
                   ),
                 ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Text(
+                    '同一工作区若在多个 AI 工具中在线，会分别列出；请选择要接收指令的工具。隐藏只影响这台手机的显示。',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+                const SizedBox(height: 8),
                 Expanded(
                   child: s.projects.isEmpty
                       ? Center(
@@ -197,10 +354,43 @@ class _ProjectSheet extends StatelessWidget {
                           ),
                         )
                       : ListView.separated(
-                          itemCount: s.projects.length,
-                          separatorBuilder: (_, __) => const Divider(height: 1),
+                          itemCount:
+                              visibleProjects.length +
+                              (hiddenProjects.isEmpty ? 0 : 1),
+                          separatorBuilder: (_, _) => const Divider(height: 1),
                           itemBuilder: (_, i) {
-                            final p = s.projects[i];
+                            if (i == visibleProjects.length &&
+                                hiddenProjects.isNotEmpty) {
+                              return ExpansionTile(
+                                leading: const Icon(
+                                  Icons.visibility_off_outlined,
+                                ),
+                                title: Text('已隐藏项目（${hiddenProjects.length}）'),
+                                children: [
+                                  for (final p in hiddenProjects)
+                                    ListTile(
+                                      leading: const Icon(
+                                        Icons.visibility_off_outlined,
+                                      ),
+                                      title: Text(p.displayName),
+                                      subtitle: Text(
+                                        '${p.ideLabel} · ${p.workspacePath}',
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      trailing: IconButton(
+                                        tooltip: '恢复显示',
+                                        onPressed: () =>
+                                            s.setProjectHidden(p.id, false),
+                                        icon: const Icon(
+                                          Icons.visibility_outlined,
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              );
+                            }
+                            final p = visibleProjects[i];
                             final selected = s.activeProjectId == p.id;
                             return ListTile(
                               selected: selected,
@@ -217,8 +407,26 @@ class _ProjectSheet extends StatelessWidget {
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                               ),
-                              trailing:
-                                  selected ? const Icon(Icons.check) : null,
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (selected) const Icon(Icons.check),
+                                  PopupMenuButton<String>(
+                                    tooltip: '项目显示选项',
+                                    onSelected: (value) {
+                                      if (value == 'hide') {
+                                        s.setProjectHidden(p.id, true);
+                                      }
+                                    },
+                                    itemBuilder: (_) => const [
+                                      PopupMenuItem(
+                                        value: 'hide',
+                                        child: Text('在手机端隐藏'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
                               onTap: () async {
                                 await s.selectProject(p.id);
                                 if (context.mounted) Navigator.pop(context);
@@ -279,7 +487,10 @@ class _ProjectSheet extends StatelessWidget {
                         border: OutlineInputBorder(),
                       ),
                       items: const [
-                        DropdownMenuItem(value: 'cursor', child: Text('Cursor')),
+                        DropdownMenuItem(
+                          value: 'cursor',
+                          child: Text('Cursor'),
+                        ),
                         DropdownMenuItem(value: 'codex', child: Text('Codex')),
                       ],
                       onChanged: busy
@@ -290,12 +501,11 @@ class _ProjectSheet extends StatelessWidget {
                     ),
                     if (state.recentWorkspacePaths.isNotEmpty) ...[
                       const SizedBox(height: 12),
-                      Text(
-                        '最近打开',
-                        style: Theme.of(ctx).textTheme.labelMedium,
-                      ),
+                      Text('最近打开', style: Theme.of(ctx).textTheme.labelMedium),
                       const SizedBox(height: 4),
-                      ...state.recentWorkspacePaths.take(5).map(
+                      ...state.recentWorkspacePaths
+                          .take(5)
+                          .map(
                             (p) => ListTile(
                               dense: true,
                               contentPadding: EdgeInsets.zero,
@@ -331,9 +541,9 @@ class _ProjectSheet extends StatelessWidget {
                             );
                             if (!ctx.mounted) return;
                             Navigator.pop(ctx);
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text(msg)),
-                            );
+                            ScaffoldMessenger.of(
+                              context,
+                            ).showSnackBar(SnackBar(content: Text(msg)));
                           } catch (e) {
                             setLocal(() => busy = false);
                             if (!ctx.mounted) return;

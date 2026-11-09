@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
 import type { PromptDelivery } from "@codeassist/shared";
@@ -29,6 +31,120 @@ function agentIdleTimeoutMs(): number {
 function agentMaxTimeoutMs(): number {
   // 兼容旧变量名 CODEASSIST_AGENT_TIMEOUT_MS 作为绝对上限
   return envMs("CODEASSIST_AGENT_TIMEOUT_MS", DEFAULT_MAX_TIMEOUT_MS, 60_000);
+}
+
+type AgentSessionLock = {
+  setAgentPid: (pid: number | undefined) => void;
+  release: () => void;
+};
+
+type AgentSessionLockOwner = {
+  token: string;
+  pid: number;
+  agentPid?: number;
+  host: string;
+  heartbeatAt: number;
+};
+
+function processIsAlive(pid: number | undefined): boolean {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Serialize writes to a Cursor/Codex conversation across duplicate bridge/MCP
+ * processes. The in-memory drain guard only protects one process; a lock in the
+ * OS temp directory is shared by all consumers on this machine.
+ */
+async function acquireAgentSessionLock(
+  projectId: string,
+  chatSessionId?: string,
+): Promise<AgentSessionLock> {
+  const key = `${projectId}:${chatSessionId || "default"}`;
+  const name = createHash("sha256").update(key).digest("hex");
+  const dir = path.join(os.tmpdir(), "codeassist-agent-locks");
+  fs.mkdirSync(dir, { recursive: true });
+  const lockPath = path.join(dir, `${name}.lock`);
+  const token = randomUUID();
+  const owner: AgentSessionLockOwner = {
+    token,
+    pid: process.pid,
+    host: os.hostname(),
+    heartbeatAt: Date.now(),
+  };
+  const writeOwner = () => {
+    try {
+      const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
+      if (current.token === token) {
+        owner.heartbeatAt = Date.now();
+        fs.writeFileSync(lockPath, JSON.stringify(owner), "utf8");
+      }
+    } catch {
+      /* the lock may be removed while this process is shutting down */
+    }
+  };
+
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      fs.writeFileSync(fd, JSON.stringify(owner), "utf8");
+      fs.closeSync(fd);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      let existing: AgentSessionLockOwner | undefined;
+      let stale = false;
+      try {
+        existing = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
+        const ageMs = Date.now() - (existing.heartbeatAt || 0);
+        const sameHost = existing.host === os.hostname();
+        stale = sameHost
+          ? !processIsAlive(existing.pid) && !processIsAlive(existing.agentPid)
+          : ageMs > 2 * 60 * 60 * 1000;
+      } catch {
+        try {
+          stale = Date.now() - fs.statSync(lockPath).mtimeMs > 30_000;
+        } catch {
+          stale = true;
+        }
+      }
+      if (stale) {
+        // Re-read the owner immediately before removing a stale lock so a
+        // heartbeat or a concurrent recovery cannot delete a new owner's lock.
+        try {
+          const latest = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
+          if (!existing || latest.token === existing.token) fs.unlinkSync(lockPath);
+        } catch {
+          /* another process already reclaimed it */
+        }
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  const heartbeatTimer = setInterval(writeOwner, 15_000);
+  heartbeatTimer.unref();
+  return {
+    setAgentPid(pid) {
+      owner.agentPid = pid;
+      writeOwner();
+    },
+    release() {
+      clearInterval(heartbeatTimer);
+      try {
+        const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
+        if (current.token === token) fs.unlinkSync(lockPath);
+      } catch {
+        /* already released or reclaimed */
+      }
+    },
+  };
 }
 
 /** 可自动重试/切备用引擎的失败（绝对上限超时不重试，避免拖死队列） */
@@ -227,229 +343,237 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
 
         for (const p of prompts) seen.add(p.id);
         opts.onPrompts(prompts);
-        console.error(
-          `[codeassist-mcp] 串行执行手机指令 (${prompts.length}) → 完成后自动接下一条`,
-        );
-        const ide = opts.ide === "codex" ? "codex" : "cursor";
-        const ideLabel = ide === "codex" ? "Codex" : "Cursor";
-        notifyToast(`CodeAssist：正在 ${ideLabel} 执行手机指令`);
-        if (ide === "cursor") {
-          focusCursorWorkspace(opts.getWorkspace());
-        }
-
-        for (const p of prompts) {
-          try {
-            await api.ackPrompt(p.id);
-          } catch {
-            /* may already be running */
-          }
-        }
-
         const chatSessionId = prompts.find((p) => p.chatSessionId)?.chatSessionId;
-
-        await api
-          .syncSessionContext({
-            projectId,
-            chatSessionId,
-            summary: `正在执行手机指令：${prompts.map((p) => p.content).join(" | ").slice(0, 200)}`,
-            currentStep: `${ideLabel} Agent 执行中`,
-            openFiles: [],
-            status: "coding",
-          })
-          .catch(() => undefined);
-
-        let resumeChatId: string | undefined;
-        if (chatSessionId) {
-          try {
-            const chat = await api.getChatSession(chatSessionId);
-            resumeChatId = chat.cursorChatId;
-          } catch {
-            /* ignore */
-          }
-        }
-
-        const enrichedContents: string[] = [];
-        for (const p of prompts) {
-          enrichedContents.push(
-            await materializePromptAttachment(
-              api,
-              opts.getWorkspace(),
-              p,
-            ),
-          );
-        }
-
-        // 空闲超时 + 绝对上限；有输出会续命。硬兜底防止 Windows 杀不干净导致队列永久卡住
-        const idleMs = agentIdleTimeoutMs();
-        const maxMs = agentMaxTimeoutMs();
-        let agentResult: AgentRunResult;
-        let hardTimer: ReturnType<typeof setTimeout> | undefined;
-        let lastHeartbeatAt = 0;
-        const heartbeat = () => {
-          const now = Date.now();
-          if (now - lastHeartbeatAt < 60_000) return;
-          lastHeartbeatAt = now;
-          for (const p of prompts) {
-            void api.ackPrompt(p.id).catch(() => undefined);
-          }
-          void api
-            .syncSessionContext({
-              projectId,
-              chatSessionId,
-              summary: `手机指令执行中（仍有进度）：${prompts.map((p) => p.content).join(" | ").slice(0, 160)}`,
-              currentStep: `${ideLabel} Agent 执行中（活跃）`,
-              openFiles: [],
-              status: "coding",
-            })
-            .catch(() => undefined);
-        };
+        const sessionLock = await acquireAgentSessionLock(projectId, chatSessionId);
         try {
-          const raceAgent = (
-            run: () => Promise<AgentRunResult>,
-          ): Promise<AgentRunResult> => {
-            if (hardTimer) clearTimeout(hardTimer);
-            return Promise.race([
-              run().finally(() => {
-                if (hardTimer) clearTimeout(hardTimer);
-              }),
-              new Promise<AgentRunResult>((resolve) => {
-                hardTimer = setTimeout(() => {
-                  resolve({
-                    text: `[agent-error] 执行超过绝对上限(${Math.round(maxMs / 1000)}s)，已中止以免阻塞后续手机指令`,
-                  });
-                }, maxMs + 20_000);
-              }),
-            ]);
-          };
+            console.error(
+              `[codeassist-mcp] 串行执行手机指令 (${prompts.length}) → 完成后自动接下一条`,
+            );
+            const ide = opts.ide === "codex" ? "codex" : "cursor";
+            const ideLabel = ide === "codex" ? "Codex" : "Cursor";
+            notifyToast(`CodeAssist：正在 ${ideLabel} 执行手机指令`);
+            if (ide === "cursor") {
+              focusCursorWorkspace(opts.getWorkspace());
+            }
 
-          const runPrimary = (resume?: string) =>
-            ide === "codex"
-              ? () =>
+            for (const p of prompts) {
+              try {
+                await api.ackPrompt(p.id);
+              } catch {
+                /* may already be running */
+              }
+            }
+
+            await api
+              .syncSessionContext({
+                projectId,
+                chatSessionId,
+                summary: `正在执行手机指令：${prompts.map((p) => p.content).join(" | ").slice(0, 200)}`,
+                currentStep: `${ideLabel} Agent 执行中`,
+                openFiles: [],
+                status: "coding",
+              })
+              .catch(() => undefined);
+
+            let resumeChatId: string | undefined;
+            if (chatSessionId) {
+              try {
+                const chat = await api.getChatSession(chatSessionId);
+                resumeChatId = chat.cursorChatId;
+              } catch {
+                /* ignore */
+              }
+            }
+
+            const enrichedContents: string[] = [];
+            for (const p of prompts) {
+              enrichedContents.push(
+                await materializePromptAttachment(
+                  api,
+                  opts.getWorkspace(),
+                  p,
+                ),
+              );
+            }
+
+            // 空闲超时 + 绝对上限；有输出会续命。硬兜底防止 Windows 杀不干净导致队列永久卡住
+            const idleMs = agentIdleTimeoutMs();
+            const maxMs = agentMaxTimeoutMs();
+            let agentResult: AgentRunResult;
+            let hardTimer: ReturnType<typeof setTimeout> | undefined;
+            let lastHeartbeatAt = 0;
+            const heartbeat = () => {
+              const now = Date.now();
+              if (now - lastHeartbeatAt < 60_000) return;
+              lastHeartbeatAt = now;
+              for (const p of prompts) {
+                void api.ackPrompt(p.id).catch(() => undefined);
+              }
+              void api
+                .syncSessionContext({
+                  projectId,
+                  chatSessionId,
+                  summary: `手机指令执行中（仍有进度）：${prompts.map((p) => p.content).join(" | ").slice(0, 160)}`,
+                  currentStep: `${ideLabel} Agent 执行中（活跃）`,
+                  openFiles: [],
+                  status: "coding",
+                })
+                .catch(() => undefined);
+            };
+            try {
+              const raceAgent = (
+                run: () => Promise<AgentRunResult>,
+              ): Promise<AgentRunResult> => {
+                if (hardTimer) clearTimeout(hardTimer);
+                return Promise.race([
+                  run().finally(() => {
+                    if (hardTimer) clearTimeout(hardTimer);
+                  }),
+                  new Promise<AgentRunResult>((resolve) => {
+                    hardTimer = setTimeout(() => {
+                      resolve({
+                        text: `[agent-error] 执行超过绝对上限(${Math.round(maxMs / 1000)}s)，已中止以免阻塞后续手机指令`,
+                      });
+                    }, maxMs + 20_000);
+                  }),
+                ]);
+              };
+
+              const runPrimary = (resume?: string) =>
+                ide === "codex"
+                  ? () =>
+                      runCodexAgent(
+                        opts.getWorkspace(),
+                        enrichedContents,
+                        prompts.map((p) => p.id),
+                        resume,
+                        idleMs,
+                        maxMs,
+                        heartbeat,
+                        (pid) => sessionLock.setAgentPid(pid),
+                      )
+                  : () =>
+                      runCursorAgent(
+                        opts.getWorkspace(),
+                        enrichedContents,
+                        prompts.map((p) => p.id),
+                        resume,
+                        idleMs,
+                        maxMs,
+                        heartbeat,
+                        (pid) => sessionLock.setAgentPid(pid),
+                      );
+
+              agentResult = await raceAgent(runPrimary(resumeChatId));
+
+              // 瞬时失败时重试一次；Codex 续聊保留原 ID，避免静默切成新会话。
+              if (isRetryableAgentFailure(agentResult.text)) {
+                console.error(
+                  `[codeassist-mcp] ${ideLabel} 首次失败，自动重试一次：${agentResult.text.slice(0, 160)}`,
+                );
+                notifyToast(`CodeAssist：${ideLabel} 失败，自动重试…`);
+                const retryResumeId = ide === "codex" ? resumeChatId : undefined;
+                if (chatSessionId && !retryResumeId) {
+                  await api
+                    .updateChatSession(chatSessionId, { cursorChatId: "" })
+                    .catch(() => undefined);
+                }
+                agentResult = await raceAgent(runPrimary(retryResumeId));
+              }
+
+              // 备用2：Cursor 仍失败时，若本机有 Codex CLI 则切换 Codex 再跑
+              const allowCodexFallback =
+                process.env.CODEASSIST_FALLBACK_CODEX !== "0";
+              if (
+                ide === "cursor" &&
+                allowCodexFallback &&
+                isRetryableAgentFailure(agentResult.text) &&
+                findCodexCmd()
+              ) {
+                console.error(
+                  `[codeassist-mcp] Cursor 仍失败，备用切换 Codex：${agentResult.text.slice(0, 160)}`,
+                );
+                notifyToast("CodeAssist：Cursor 失败，改用 Codex 执行…");
+                agentResult = await raceAgent(() =>
                   runCodexAgent(
                     opts.getWorkspace(),
                     enrichedContents,
                     prompts.map((p) => p.id),
-                    resume,
+                    undefined,
                     idleMs,
                     maxMs,
                     heartbeat,
-                  )
-              : () =>
-                  runCursorAgent(
-                    opts.getWorkspace(),
-                    enrichedContents,
-                    prompts.map((p) => p.id),
-                    resume,
-                    idleMs,
-                    maxMs,
-                    heartbeat,
-                  );
+                    (pid) => sessionLock.setAgentPid(pid),
+                  ),
+                );
+              }
+            } catch (err) {
+              if (hardTimer) clearTimeout(hardTimer);
+              agentResult = {
+                text: `[agent-error] ${err instanceof Error ? err.message : String(err)}`,
+              };
+            }
 
-          agentResult = await raceAgent(runPrimary(resumeChatId));
-
-          // 备用1：瞬时失败（空输出 exit、会话锁、网络）→ 丢弃 resume 再跑一轮
-          if (isRetryableAgentFailure(agentResult.text)) {
-            console.error(
-              `[codeassist-mcp] ${ideLabel} 首次失败，清空 session 后自动重试一次：${agentResult.text.slice(0, 160)}`,
-            );
-            notifyToast(`CodeAssist：${ideLabel} 失败，自动重试…`);
-            if (chatSessionId) {
+            if (chatSessionId && agentResult.cursorChatId) {
               await api
-                .updateChatSession(chatSessionId, { cursorChatId: "" })
+                .updateChatSession(chatSessionId, {
+                  cursorChatId: agentResult.cursorChatId,
+                })
                 .catch(() => undefined);
             }
-            agentResult = await raceAgent(runPrimary(undefined));
-          }
 
-          // 备用2：Cursor 仍失败时，若本机有 Codex CLI 则切换 Codex 再跑
-          const allowCodexFallback =
-            process.env.CODEASSIST_FALLBACK_CODEX !== "0";
-          if (
-            ide === "cursor" &&
-            allowCodexFallback &&
-            isRetryableAgentFailure(agentResult.text) &&
-            findCodexCmd()
-          ) {
-            console.error(
-              `[codeassist-mcp] Cursor 仍失败，备用切换 Codex：${agentResult.text.slice(0, 160)}`,
+            let resultText = agentResult.text;
+            if (resultText === "[agent-error] agent exited 1") {
+              resultText =
+                "[agent-error] agent exited 1（Cursor Agent 无输出退出）。常见原因：会话 resume 损坏、Cursor API 瞬时失败、Agent 进程崩溃。已尝试自动重试/备用引擎；仍失败请保持 Cursor 打开本项目（走 MCP 人工回合），或重登 agent status。";
+            }
+            const ok = !resultText.startsWith("[agent-error]");
+            const summary = truncate(resultText, 3500);
+
+            for (const p of prompts) {
+              try {
+                await api.completePrompt(
+                  p.id,
+                  ok ? "done" : "failed",
+                  summary || (ok ? "执行完成" : "执行失败"),
+                );
+              } catch (err) {
+                console.error("[codeassist-mcp] complete_prompt failed:", err);
+              }
+            }
+
+            await api
+              .syncSessionContext({
+                projectId,
+                chatSessionId,
+                summary: ok
+                  ? `手机指令已完成：${prompts.map((p) => p.content).join(" | ").slice(0, 120)}`
+                  : `手机指令失败：${prompts.map((p) => p.content).join(" | ").slice(0, 120)}`,
+                currentStep: ok ? "已回传结果到手机" : "执行失败，已回传错误",
+                openFiles: [],
+                status: ok ? "done" : "blocked",
+                extra: summary,
+              })
+              .catch(() => undefined);
+
+            await api
+              .createTask({
+                projectId,
+                type: ok ? "completed" : "blocked",
+                title: ok ? "手机指令执行完成" : "手机指令执行失败",
+                detail: `指令：\n${prompts.map((p) => p.content).join("\n")}\n\n结果：\n${summary}`,
+                requireDecision: false,
+              })
+              .catch(() => undefined);
+
+            notifyToast(
+              ok
+                ? "CodeAssist：结果已同步到手机"
+                : "CodeAssist：执行失败，错误已同步到手机",
             );
-            notifyToast("CodeAssist：Cursor 失败，改用 Codex 执行…");
-            agentResult = await raceAgent(() =>
-              runCodexAgent(
-                opts.getWorkspace(),
-                enrichedContents,
-                prompts.map((p) => p.id),
-                undefined,
-                idleMs,
-                maxMs,
-                heartbeat,
-              ),
-            );
-          }
-        } catch (err) {
-          if (hardTimer) clearTimeout(hardTimer);
-          agentResult = {
-            text: `[agent-error] ${err instanceof Error ? err.message : String(err)}`,
-          };
+        } finally {
+          sessionLock.release();
         }
-
-        if (chatSessionId && agentResult.cursorChatId) {
-          await api
-            .updateChatSession(chatSessionId, {
-              cursorChatId: agentResult.cursorChatId,
-            })
-            .catch(() => undefined);
-        }
-
-        let resultText = agentResult.text;
-        if (resultText === "[agent-error] agent exited 1") {
-          resultText =
-            "[agent-error] agent exited 1（Cursor Agent 无输出退出）。常见原因：会话 resume 损坏、Cursor API 瞬时失败、Agent 进程崩溃。已尝试自动重试/备用引擎；仍失败请保持 Cursor 打开本项目（走 MCP 人工回合），或重登 agent status。";
-        }
-        const ok = !resultText.startsWith("[agent-error]");
-        const summary = truncate(resultText, 3500);
-
-        for (const p of prompts) {
-          try {
-            await api.completePrompt(
-              p.id,
-              ok ? "done" : "failed",
-              summary || (ok ? "执行完成" : "执行失败"),
-            );
-          } catch (err) {
-            console.error("[codeassist-mcp] complete_prompt failed:", err);
-          }
-        }
-
-        await api
-          .syncSessionContext({
-            projectId,
-            chatSessionId,
-            summary: ok
-              ? `手机指令已完成：${prompts.map((p) => p.content).join(" | ").slice(0, 120)}`
-              : `手机指令失败：${prompts.map((p) => p.content).join(" | ").slice(0, 120)}`,
-            currentStep: ok ? "已回传结果到手机" : "执行失败，已回传错误",
-            openFiles: [],
-            status: ok ? "done" : "blocked",
-            extra: summary,
-          })
-          .catch(() => undefined);
-
-        await api
-          .createTask({
-            projectId,
-            type: ok ? "completed" : "blocked",
-            title: ok ? "手机指令执行完成" : "手机指令执行失败",
-            detail: `指令：\n${prompts.map((p) => p.content).join("\n")}\n\n结果：\n${summary}`,
-            requireDecision: false,
-          })
-          .catch(() => undefined);
-
-        notifyToast(
-          ok
-            ? "CodeAssist：结果已同步到手机"
-            : "CodeAssist：执行失败，错误已同步到手机",
-        );
         // 继续 while：再 pull 下一条 queued
         wakeAgain = true;
       } while (!closed && wakeAgain);
@@ -586,6 +710,8 @@ type AgentRunResult = { text: string; cursorChatId?: string };
 
 function extractCursorChatId(raw: string): string | undefined {
   const patterns = [
+    /"thread_id"\s*:\s*"([^"]+)"/i,
+    /"threadId"\s*:\s*"([^"]+)"/i,
     /"session_id"\s*:\s*"([^"]+)"/i,
     /"chatId"\s*:\s*"([^"]+)"/i,
     /"chat_id"\s*:\s*"([^"]+)"/i,
@@ -597,7 +723,14 @@ function extractCursorChatId(raw: string): string | undefined {
   }
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    for (const key of ["session_id", "chatId", "chat_id", "conversation_id"]) {
+    for (const key of [
+      "thread_id",
+      "threadId",
+      "session_id",
+      "chatId",
+      "chat_id",
+      "conversation_id",
+    ]) {
       const v = parsed[key];
       if (typeof v === "string" && v) return v;
     }
@@ -668,6 +801,7 @@ function runCursorAgent(
   idleTimeoutMs: number = agentIdleTimeoutMs(),
   maxTimeoutMs: number = agentMaxTimeoutMs(),
   onActivity?: () => void,
+  onSpawn?: (pid: number | undefined) => void,
 ): Promise<AgentRunResult> {
   return new Promise((resolve) => {
     const launch = resolveAgentLaunch();
@@ -763,6 +897,7 @@ function runCursorAgent(
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    onSpawn?.(child.pid);
 
     const abortForTimeout = (reason: string) => {
       if (settled) return;
@@ -905,6 +1040,7 @@ function runCodexAgent(
   idleTimeoutMs: number = agentIdleTimeoutMs(),
   maxTimeoutMs: number = agentMaxTimeoutMs(),
   onActivity?: () => void,
+  onSpawn?: (pid: number | undefined) => void,
 ): Promise<AgentRunResult> {
   return new Promise((resolve) => {
     const codex = findCodexCmd();
@@ -950,29 +1086,33 @@ function runCodexAgent(
       /* ignore */
     }
 
-    // 新会话执行（Codex resume 子命令参数与 prompt 组合不稳定，先走干净 exec）
-    const args = [
-      "exec",
-      "-C",
-      workspace,
-      "-s",
-      "danger-full-access",
+    // ChatGPT 登录账号不支持部分默认新模型（如 gpt-6.1-sol），显式指定可用模型。
+    // 可用 CODEASSIST_CODEX_MODEL 覆盖，例如 gpt-5.6-luna / gpt-6-luna。
+    const model =
+      process.env.CODEASSIST_CODEX_MODEL?.trim() || "gpt-6-luna";
+
+    // Mobile prompts run headlessly, so there is no terminal UI to answer
+    // Codex's on-request approval prompts. Route eligible requests through
+    // Codex automatic review; this uses the workspace-write sandbox and can
+    // still deny risky actions. Keep the flag before `resume` so it applies
+    // to both new and resumed sessions.
+    const args = ["exec", "--approve-for-me", "-C", workspace];
+    if (resumeChatId) {
+      args.push("resume", resumeChatId);
+      console.error(`[codeassist-mcp] 续跑 Codex session: ${resumeChatId}`);
+    }
+    args.push(
+      "-m",
+      model,
       "--json",
       "-o",
       outFile,
       "--skip-git-repo-check",
-      "--color",
-      "never",
       promptArg,
-    ];
-    if (resumeChatId) {
-      console.error(
-        `[codeassist-mcp] Codex 忽略 resume=${resumeChatId}，使用新 exec 会话`,
-      );
-    }
+    );
 
     console.error(
-      `[codeassist-mcp] Codex 执行中(idle=${Math.round(idleTimeoutMs / 1000)}s, max=${Math.round(maxTimeoutMs / 1000)}s): ${codex}`,
+      `[codeassist-mcp] Codex 执行中(model=${model}, idle=${Math.round(idleTimeoutMs / 1000)}s, max=${Math.round(maxTimeoutMs / 1000)}s): ${codex}`,
     );
 
     let out = "";
@@ -1003,15 +1143,37 @@ function runCodexAgent(
       resolve({ text, cursorChatId });
     };
 
-    // resume 子命令参数形态不同：若带 resume 用 `codex exec resume <id> ...`
-    // 上面把 resume 插在 exec 后；再检查实际 argv
+    // Resume must use the same Codex home as the desktop app that owns the thread.
+    const userProfile = process.env.USERPROFILE?.trim() || os.homedir();
+    const homeRoot = path.parse(userProfile).root;
+    const codexHome =
+      process.env.CODEX_HOME?.trim() || path.join(userProfile, ".codex");
+
     const child = spawn(codex, args, {
       cwd: workspace,
       shell: false,
       windowsHide: true,
-      env: { ...process.env, CI: process.env.CI || "1", NO_COLOR: "1" },
+      env: {
+        ...process.env,
+        HOME: userProfile,
+        CODEX_HOME: codexHome,
+        ...(process.platform === "win32"
+          ? {
+              USERPROFILE: userProfile,
+              HOMEDRIVE:
+                process.env.HOMEDRIVE || homeRoot.replace(/[\\/]+$/, ""),
+              HOMEPATH:
+                process.env.HOMEPATH ||
+                userProfile.slice(homeRoot.length) ||
+                path.sep,
+            }
+          : {}),
+        CI: process.env.CI || "1",
+        NO_COLOR: "1",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    onSpawn?.(child.pid);
 
     const abortForTimeout = (reason: string) => {
       if (settled) return;

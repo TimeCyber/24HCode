@@ -9,15 +9,19 @@ import { z } from "zod";
 import type { Decision, PromptDelivery, Project } from "@codeassist/shared";
 import { ApiClient } from "./api-client.js";
 import { startLivePull } from "./live-pull.js";
+import { startCodexUsageReporter } from "./codex-usage.js";
+import { startCodexDesktopSessionReporter } from "./codex-desktop-sessions.js";
 
 const SERVER_URL = (
   process.env.CODEASSIST_SERVER_URL ?? "http://127.0.0.1:8787"
 ).replace(/\/$/, "");
-const TOKEN = process.env.CODEASSIST_TOKEN ?? "codeassist-dev-token";
+// CODEASSIST_TOKEN authenticates this relay connection; it is separate from
+// the mobile user's mcp-x login token.
+const RELAY_TOKEN = process.env.CODEASSIST_TOKEN ?? "codeassist-dev-token";
 const IDE = (process.env.CODEASSIST_IDE ?? "cursor") as "cursor" | "codex";
 const POLL_MS = Number(process.env.CODEASSIST_POLL_MS ?? 3000);
 
-const api = new ApiClient(SERVER_URL, TOKEN);
+const api = new ApiClient(SERVER_URL, RELAY_TOKEN);
 
 const MCP_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEVICE_ENV_FILE = path.resolve(MCP_ROOT, "..", ".codeassist-device.env");
@@ -59,14 +63,20 @@ function cloudPeerApi(): ApiClient | null {
     .replace(/\/$/, "");
   const token = String(env.CODEASSIST_TOKEN || "").trim();
   if (!url || !token || isLocalRelayUrl(url)) return null;
-  if (url === SERVER_URL && token === TOKEN) return null;
+  if (url === SERVER_URL && token === RELAY_TOKEN) return null;
   return new ApiClient(url, token);
 }
 
 let project: Project | null = null;
-let cachedPrompts: PromptDelivery[] = [];
+const cachedPromptsByProject = new Map<string, PromptDelivery[]>();
 let cachedDecisions: Decision[] = [];
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let projectWorkerTimer: ReturnType<typeof setInterval> | null = null;
+let syncingProjectWorkers = false;
+const projectWorkers = new Map<
+  string,
+  { workspacePath: string; stop: () => void }
+>();
 /** Workspace resolved after MCP connect (prefer Cursor roots). */
 let resolvedWorkspace: string | null = null;
 
@@ -288,6 +298,80 @@ function startPolling() {
   pollTimer = setInterval(() => void pollOnce(), POLL_MS);
 }
 
+function isLocalProjectWorkspace(candidate: Project): boolean {
+  try {
+    return fs.statSync(path.resolve(candidate.workspacePath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function syncProjectWorkers() {
+  if (syncingProjectWorkers) return;
+  syncingProjectWorkers = true;
+  try {
+    const projects = await api.listProjects();
+    const wanted = projects.filter(
+      (candidate) =>
+        candidate.online &&
+        candidate.ide === IDE &&
+        isLocalProjectWorkspace(candidate),
+    );
+    const wantedIds = new Set(wanted.map((candidate) => candidate.id));
+
+    for (const [id, worker] of projectWorkers) {
+      if (wantedIds.has(id)) continue;
+      worker.stop();
+      projectWorkers.delete(id);
+      cachedPromptsByProject.delete(id);
+    }
+
+    for (const candidate of wanted) {
+      const workspacePath = path.resolve(candidate.workspacePath);
+      const existing = projectWorkers.get(candidate.id);
+      if (
+        existing &&
+        normalizeWorkspacePath(existing.workspacePath) ===
+          normalizeWorkspacePath(workspacePath)
+      ) {
+        continue;
+      }
+      existing?.stop();
+      const stop = startLivePull(api, {
+        serverUrl: SERVER_URL,
+        token: RELAY_TOKEN,
+        ide: IDE === "codex" ? "codex" : "cursor",
+        getProjectId: () => candidate.id,
+        getWorkspace: () => workspacePath,
+        onPrompts: (prompts) => {
+          const cached = cachedPromptsByProject.get(candidate.id) ?? [];
+          cachedPromptsByProject.set(
+            candidate.id,
+            [...cached, ...prompts].slice(-50),
+          );
+        },
+      });
+      projectWorkers.set(candidate.id, { workspacePath, stop });
+      console.error(
+        `[codeassist-mcp] project worker started project=${candidate.id} workspace=${workspacePath}`,
+      );
+    }
+  } catch (err) {
+    console.error("[codeassist-mcp] project worker sync failed:", err);
+  } finally {
+    syncingProjectWorkers = false;
+  }
+}
+
+function startProjectWorkerPolling() {
+  if (projectWorkerTimer) return;
+  void syncProjectWorkers();
+  projectWorkerTimer = setInterval(
+    () => void syncProjectWorkers(),
+    Math.max(POLL_MS * 4, 10_000),
+  );
+}
+
 server.tool(
   "register_project",
   "Register or refresh this Cursor/Codex workspace with the CodeAssist relay server so mobile clients can see and target it.",
@@ -299,6 +383,7 @@ server.tool(
     await refreshWorkspaceFromClient();
     project = await ensureRegistered(name);
     startPolling();
+    startProjectWorkerPolling();
     return {
       content: [{ type: "text", text: JSON.stringify(project, null, 2) }],
     };
@@ -363,8 +448,9 @@ server.tool(
     const p = await ensureRegistered();
     startPolling();
     const fresh = await api.pullPrompts(p.id);
-    const all = [...cachedPrompts, ...fresh];
-    cachedPrompts = [];
+    const cached = cachedPromptsByProject.get(p.id) ?? [];
+    cachedPromptsByProject.delete(p.id);
+    const all = [...cached, ...fresh];
     return {
       content: [
         {
@@ -572,17 +658,24 @@ async function main() {
     await refreshWorkspaceFromClient();
     await ensureRegistered();
     startPolling();
-    // Phone send → relay WS → MCP pulls immediately + spawn Agent CLI
-    startLivePull(api, {
-      serverUrl: SERVER_URL,
-      token: TOKEN,
-      ide: IDE === "codex" ? "codex" : "cursor",
-      getProjectId: () => project?.id ?? null,
-      getWorkspace: () => currentWorkspace(),
-      onPrompts: (prompts) => {
-        cachedPrompts.push(...prompts);
-      },
-    });
+    startProjectWorkerPolling();
+    if (IDE === "codex") {
+      startCodexUsageReporter(api, () => project?.id ?? null, () => {
+        const peer = cloudPeerApi();
+        return peer ? [peer] : [];
+      });
+      startCodexDesktopSessionReporter(
+        api,
+        () => project?.id ?? null,
+        () => currentWorkspace(),
+        () => {
+          const peer = cloudPeerApi();
+          return peer ? [peer] : [];
+        },
+      );
+    }
+    // Each locally available project gets its own pull loop and draining lock.
+    // Switching workspace while one Agent run is active won't queue other projects.
   } catch (err) {
     console.error("[codeassist-mcp] initial register failed:", err);
   }

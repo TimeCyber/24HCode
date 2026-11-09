@@ -8,9 +8,9 @@ set "API=%~2"
 if "%API%"=="" set "API=https://mcp-x.com/prod-api"
 
 if "%CODE%"=="" (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0pair-claim.ps1" -ApiRoot "%API%"
+node "%~dp0pair-claim.mjs" "%CODE%" "%API%"
 ) else (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0pair-claim.ps1" -Code "%CODE%" -ApiRoot "%API%"
+  node "%~dp0pair-claim.mjs" "%CODE%" "%API%"
 )
 
 if errorlevel 1 (

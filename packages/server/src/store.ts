@@ -4,6 +4,8 @@ import path from "node:path";
 import { nanoid } from "nanoid";
 import {
   type ChatSession,
+  type CodexDesktopSession,
+  type CodexUsageSnapshot,
   type CreateChatSessionRequest,
   type CreateFileTransferRequest,
   type CreatePromptRequest,
@@ -20,6 +22,8 @@ import {
   type RegisterProjectRequest,
   type SessionContext,
   type SyncSessionContextRequest,
+  type SyncCodexDesktopSessionsRequest,
+  type SyncCodexUsageRequest,
   type TaskEvent,
   type TaskStatus,
   type UpdateChatSessionRequest,
@@ -241,6 +245,23 @@ export class Store {
         this.db
           .prepare(
             `UPDATE session_contexts SET project_id = ? WHERE project_id = ?`,
+          )
+          .run(canonicalId, oldId);
+      }
+
+      const hasCanonicalUsage = this.db
+        .prepare(
+          `SELECT project_id FROM codex_usage_snapshots WHERE project_id = ?`,
+        )
+        .get(canonicalId);
+      if (hasCanonicalUsage) {
+        this.db
+          .prepare(`DELETE FROM codex_usage_snapshots WHERE project_id = ?`)
+          .run(oldId);
+      } else {
+        this.db
+          .prepare(
+            `UPDATE codex_usage_snapshots SET project_id = ? WHERE project_id = ?`,
           )
           .run(canonicalId, oldId);
       }
@@ -697,9 +718,21 @@ export class Store {
     };
   }
 
-  /** 默认一次只取 1 条，保证 Cursor 串行；取完后调用方可再拉下一条。 */
+  /**
+   * 同一项目同一时间只允许一条指令处于 delivered/running；不同项目互不阻塞。
+   * Node 的同步 SQLite 操作保证检查与认领不会被另一个请求插入。
+   */
   pullPrompts(projectId: string, limit = 1): PromptDelivery[] {
     const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 1));
+    const active = this.db
+      .prepare(
+        `SELECT 1 FROM prompt_deliveries
+         WHERE project_id = ? AND status IN ('delivered', 'running')
+         LIMIT 1`,
+      )
+      .get(projectId);
+    if (active) return [];
+
     const rows = this.db
       .prepare(
         `SELECT id, prompt_id, project_id, content, status, created_at, updated_at, result, chat_session_id
@@ -793,6 +826,19 @@ export class Store {
       )
       .get(id) as Record<string, unknown> | undefined;
     return row ? this.enrichDelivery(mapDelivery(row)) : null;
+  }
+
+  listRecentPromptDeliveries(limit = 100): PromptDelivery[] {
+    const safeLimit = Math.max(1, Math.min(Math.trunc(limit), 500));
+    const rows = this.db
+      .prepare(
+        `SELECT id, prompt_id, project_id, content, status, created_at, updated_at, result, chat_session_id
+         FROM prompt_deliveries
+         ORDER BY updated_at DESC
+         LIMIT ?`,
+      )
+      .all(safeLimit) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.enrichDelivery(mapDelivery(row)));
   }
 
   private enrichDelivery(delivery: PromptDelivery): PromptDelivery {
@@ -1119,6 +1165,72 @@ export class Store {
     return rows.map(mapSession);
   }
 
+  upsertCodexUsage(
+    projectId: string,
+    input: SyncCodexUsageRequest,
+  ): CodexUsageSnapshot {
+    const now = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO codex_usage_snapshots
+         (project_id, plan_type, primary_window, secondary_window, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(project_id) DO UPDATE SET
+           plan_type = excluded.plan_type,
+           primary_window = excluded.primary_window,
+           secondary_window = excluded.secondary_window,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        projectId,
+        input.planType ?? null,
+        input.primary ? JSON.stringify(input.primary) : null,
+        input.secondary ? JSON.stringify(input.secondary) : null,
+        now,
+      );
+    return this.getCodexUsage(projectId)!;
+  }
+
+  getCodexUsage(projectId: string): CodexUsageSnapshot | null {
+    const row = this.db
+      .prepare(
+        `SELECT project_id, plan_type, primary_window, secondary_window, updated_at
+         FROM codex_usage_snapshots WHERE project_id = ?`,
+      )
+      .get(projectId) as Record<string, unknown> | undefined;
+    return row ? mapCodexUsage(row) : null;
+  }
+
+  upsertCodexDesktopSessions(
+    projectId: string,
+    input: SyncCodexDesktopSessionsRequest,
+  ): CodexDesktopSession[] {
+    this.db
+      .prepare(
+        `INSERT INTO codex_desktop_sessions (project_id, sessions_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(project_id) DO UPDATE SET
+           sessions_json = excluded.sessions_json,
+           updated_at = excluded.updated_at`,
+      )
+      .run(projectId, JSON.stringify(input.sessions), nowIso());
+    return input.sessions;
+  }
+
+  getCodexDesktopSessions(projectId: string): CodexDesktopSession[] {
+    const row = this.db
+      .prepare(
+        `SELECT sessions_json FROM codex_desktop_sessions WHERE project_id = ?`,
+      )
+      .get(projectId) as Record<string, unknown> | undefined;
+    if (!row) return [];
+    try {
+      return JSON.parse(String(row.sessions_json)) as CodexDesktopSession[];
+    } catch {
+      return [];
+    }
+  }
+
   /** 找一个指定 IDE 的在线项目，供打开工作区时默认经由 */
   findOnlineProjectForIde(ide: Ide): Project | null {
     const list = this.listProjects().filter(
@@ -1230,6 +1342,26 @@ function mapSession(row: Record<string, unknown>): SessionContext {
     status: row.status as SessionContext["status"],
     extra: row.extra ? String(row.extra) : undefined,
     createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function mapCodexUsage(row: Record<string, unknown>): CodexUsageSnapshot {
+  const parseWindow = (
+    value: unknown,
+  ): CodexUsageSnapshot["primary"] => {
+    if (!value) return undefined;
+    try {
+      return JSON.parse(String(value)) as CodexUsageSnapshot["primary"];
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    projectId: String(row.project_id),
+    planType: row.plan_type ? String(row.plan_type) : undefined,
+    primary: parseWindow(row.primary_window),
+    secondary: parseWindow(row.secondary_window),
     updatedAt: String(row.updated_at),
   };
 }

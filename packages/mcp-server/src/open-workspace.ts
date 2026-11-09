@@ -120,6 +120,7 @@ export function startBridgeForWorkspace(opts: {
         CODEASSIST_IDE: ide,
         CODEASSIST_WORKSPACE: workspace,
         CODEASSIST_PROJECT_NAME: path.basename(workspace) || "project",
+        CODEASSIST_PROJECT_WORKER_ONLY: "1",
       },
     }).unref();
     return { ok: true, detail: `已启动 ${ide} bridge: ${workspace}` };

@@ -11,14 +11,12 @@ class ApiClient {
   String token;
 
   Map<String, String> get _headers => {
-        'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json',
-      };
+    'Authorization': 'Bearer $token',
+    'Content-Type': 'application/json',
+  };
 
   /// GET/DELETE 勿带 Content-Type: application/json（无 body 时 Fastify 会 400）
-  Map<String, String> get _authHeaders => {
-        'Authorization': 'Bearer $token',
-      };
+  Map<String, String> get _authHeaders => {'Authorization': 'Bearer $token'};
 
   Uri _uri(String path, [Map<String, String>? query]) {
     final normalized = baseUrl.replaceAll(RegExp(r'/+$'), '');
@@ -49,7 +47,10 @@ class ApiClient {
     if (decoded is Map) {
       final map = Map<String, dynamic>.from(decoded);
       final code = map['code'];
-      if (code != null && code != 200 && code != '200' && map.containsKey('msg')) {
+      if (code != null &&
+          code != 200 &&
+          code != '200' &&
+          map.containsKey('msg')) {
         throw Exception(map['msg']?.toString() ?? '请求失败($code)');
       }
       final data = map['data'];
@@ -65,6 +66,31 @@ class ApiClient {
     final list = _asList(res.body);
     return list
         .map((e) => Project.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<CodexUsageSnapshot?> getCodexUsage(String projectId) async {
+    final res = await http.get(
+      _uri('/api/codex-usage/${Uri.encodeComponent(projectId)}'),
+      headers: _authHeaders,
+    );
+    _ensureOk(res);
+    final decoded = jsonDecode(res.body);
+    if (decoded == null) return null;
+    return CodexUsageSnapshot.fromJson(
+      Map<String, dynamic>.from(decoded as Map),
+    );
+  }
+
+  Future<List<ProjectActivity>> listRecentProjectActivity() async {
+    final res = await http.get(
+      _uri('/api/project-activity'),
+      headers: _headers,
+    );
+    _ensureOk(res);
+    final list = _asList(res.body);
+    return list
+        .map((e) => ProjectActivity.fromJson(e as Map<String, dynamic>))
         .toList();
   }
 
@@ -140,7 +166,10 @@ class ApiClient {
         .toList();
   }
 
-  Future<ChatSession> createChatSession(String projectId, {String? title}) async {
+  Future<ChatSession> createChatSession(
+    String projectId, {
+    String? title,
+  }) async {
     final res = await http.post(
       _uri('/api/chat-sessions'),
       headers: _headers,
@@ -150,9 +179,32 @@ class ApiClient {
       }),
     );
     _ensureOk(res);
-    return ChatSession.fromJson(
-      jsonDecode(res.body) as Map<String, dynamic>,
+    return ChatSession.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
+  Future<void> updateChatSession(
+    String sessionId, {
+    String? cursorChatId,
+  }) async {
+    final res = await http.patch(
+      _uri('/api/chat-sessions/$sessionId'),
+      headers: _headers,
+      body: jsonEncode({'cursorChatId': ?cursorChatId}),
     );
+    _ensureOk(res);
+  }
+
+  Future<List<CodexDesktopSession>> listCodexDesktopSessions(
+    String projectId,
+  ) async {
+    final res = await http.get(
+      _uri('/api/codex-sessions/$projectId'),
+      headers: _headers,
+    );
+    _ensureOk(res);
+    return _asList(res.body)
+        .map((e) => CodexDesktopSession.fromJson(e as Map<String, dynamic>))
+        .toList();
   }
 
   Future<void> deleteChatSession(String sessionId) async {
@@ -227,8 +279,10 @@ class ApiClient {
   }
 
   Future<List<SessionContext>> listSessionContexts() async {
-    final res =
-        await http.get(_uri('/api/session-contexts'), headers: _headers);
+    final res = await http.get(
+      _uri('/api/session-contexts'),
+      headers: _headers,
+    );
     _ensureOk(res);
     final list = _asList(res.body);
     return list

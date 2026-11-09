@@ -11,6 +11,8 @@ import {
   OpenWorkspaceRequestSchema,
   RegisterProjectRequestSchema,
   SubmitDecisionRequestSchema,
+  SyncCodexDesktopSessionsRequestSchema,
+  SyncCodexUsageRequestSchema,
   SyncSessionContextRequestSchema,
   UpdateChatSessionRequestSchema,
 } from "@codeassist/shared";
@@ -125,6 +127,10 @@ app.post("/api/projects/:id/heartbeat", async (req, reply) => {
 });
 
 app.get("/api/projects", async () => store.listProjects());
+
+app.get("/api/project-activity", async () =>
+  store.listRecentPromptDeliveries(),
+);
 
 /** 手机：请求 PC 端打开指定工作区（由在线 MCP/桥接认领执行） */
 app.post("/api/projects/open", async (req, reply) => {
@@ -388,6 +394,56 @@ app.post("/api/mcp/session-context", async (req, reply) => {
     }
   }
   return ctx;
+});
+
+app.put("/api/mcp/codex-usage/:projectId", async (req, reply) => {
+  const { projectId } = req.params as { projectId: string };
+  const parsed = SyncCodexUsageRequestSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const project = store.getProject(projectId);
+  if (!project) return reply.code(404).send({ error: "project not found" });
+  if (project.ide !== "codex") {
+    return reply.code(409).send({ error: "project is not a Codex project" });
+  }
+  const usage = store.upsertCodexUsage(projectId, parsed.data);
+  hub.broadcast("codex.usage.updated", usage, projectId);
+  return usage;
+});
+
+app.get("/api/codex-usage/:projectId", async (req, reply) => {
+  const { projectId } = req.params as { projectId: string };
+  const project = store.getProject(projectId);
+  if (!project) return reply.code(404).send({ error: "project not found" });
+  if (project.ide !== "codex") {
+    return reply.code(409).send({ error: "project is not a Codex project" });
+  }
+  return store.getCodexUsage(projectId);
+});
+
+app.put("/api/mcp/codex-sessions/:projectId", async (req, reply) => {
+  const { projectId } = req.params as { projectId: string };
+  const parsed = SyncCodexDesktopSessionsRequestSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const project = store.getProject(projectId);
+  if (!project) return reply.code(404).send({ error: "project not found" });
+  if (project.ide !== "codex") {
+    return reply.code(409).send({ error: "project is not a Codex project" });
+  }
+  return store.upsertCodexDesktopSessions(projectId, parsed.data);
+});
+
+app.get("/api/codex-sessions/:projectId", async (req, reply) => {
+  const { projectId } = req.params as { projectId: string };
+  const project = store.getProject(projectId);
+  if (!project) return reply.code(404).send({ error: "project not found" });
+  if (project.ide !== "codex") {
+    return reply.code(409).send({ error: "project is not a Codex project" });
+  }
+  return store.getCodexDesktopSessions(projectId);
 });
 
 app.post("/api/files", async (req, reply) => {

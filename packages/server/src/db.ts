@@ -75,6 +75,20 @@ export function openDb(dbPath: string): Db {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS codex_usage_snapshots (
+      project_id TEXT PRIMARY KEY,
+      plan_type TEXT,
+      primary_window TEXT,
+      secondary_window TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS codex_desktop_sessions (
+      project_id TEXT PRIMARY KEY,
+      sessions_json TEXT NOT NULL DEFAULT '[]',
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS chat_sessions (
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,

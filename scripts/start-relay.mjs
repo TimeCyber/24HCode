@@ -9,9 +9,13 @@
  *   或双击 / 计划任务：start-codeassist-all.bat
  */
 import { spawn } from "node:child_process";
+import dns from "node:dns";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+// Windows 上云端域名可能优先解析到不可达的 IPv6 地址。
+dns.setDefaultResultOrder("ipv4first");
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const logDir = path.join(root, "packages", "mcp-server");
@@ -50,6 +54,10 @@ function isLocalUrl(url) {
 }
 
 const deviceEnv = loadDeviceEnvFile(deviceEnvFile);
+const aigirlWorkspace = path.resolve(
+  process.env.CODEASSIST_AIGIRL_WORKSPACE || path.join(root, "..", "AIgirl"),
+);
+const aigirlName = process.env.CODEASSIST_AIGIRL_PROJECT_NAME || "aigirl";
 
 const LOCAL_URL = (
   process.env.CODEASSIST_LOCAL_SERVER_URL ||
@@ -110,7 +118,11 @@ async function healthOk(baseUrl) {
 function spawnLogged(name, command, args, cwd, logFile, childEnv) {
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   const out = fs.openSync(logFile, "a");
-  const child = spawn(command, args, {
+  const childArgs =
+    command.toLowerCase() === nodeExe.toLowerCase()
+      ? ["--dns-result-order=ipv4first", ...args]
+      : args;
+  const child = spawn(command, childArgs, {
     cwd,
     env: childEnv,
     stdio: ["ignore", out, out],
@@ -187,6 +199,21 @@ async function main() {
     CODEASSIST_TOKEN: LOCAL_TOKEN,
   });
 
+  if (fs.existsSync(aigirlWorkspace)) {
+    const aigirlBridgeLog = path.join(logDir, "aigirl-bridge-local.log");
+    log(`starting local Codex bridge for ${aigirlWorkspace} → ${LOCAL_URL}`);
+    spawnLogged("bridge-aigirl-local", nodeExe, [bridgeJs], root, aigirlBridgeLog, {
+      ...baseEnv,
+      CODEASSIST_SERVER_URL: LOCAL_URL,
+      CODEASSIST_TOKEN: LOCAL_TOKEN,
+      CODEASSIST_IDE: "codex",
+      CODEASSIST_WORKSPACE: aigirlWorkspace,
+      CODEASSIST_PROJECT_NAME: aigirlName,
+    });
+  } else {
+    log(`AIgirl workspace not found, skip bridge: ${aigirlWorkspace}`);
+  }
+
   if (hasCloud) {
     if (await healthOk(cloudUrl)) {
       log(`starting cloud bridge → ${cloudUrl}`);
@@ -195,6 +222,18 @@ async function main() {
         CODEASSIST_SERVER_URL: cloudUrl,
         CODEASSIST_TOKEN: cloudToken,
       });
+      if (fs.existsSync(aigirlWorkspace)) {
+        const aigirlCloudLog = path.join(logDir, "aigirl-bridge-cloud.log");
+        log(`starting cloud Codex bridge for ${aigirlWorkspace} → ${cloudUrl}`);
+        spawnLogged("bridge-aigirl-cloud", nodeExe, [bridgeJs], root, aigirlCloudLog, {
+          ...baseEnv,
+          CODEASSIST_SERVER_URL: cloudUrl,
+          CODEASSIST_TOKEN: cloudToken,
+          CODEASSIST_IDE: "codex",
+          CODEASSIST_WORKSPACE: aigirlWorkspace,
+          CODEASSIST_PROJECT_NAME: aigirlName,
+        });
+      }
     } else {
       log(`cloud relay not reachable (${cloudUrl}), skip cloud bridge`);
     }

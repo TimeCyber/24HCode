@@ -1,5 +1,7 @@
 import type {
   ChatSession,
+  CodexDesktopSession,
+  CodexUsageSnapshot,
   CreateFileTransferRequest,
   CreateTaskRequest,
   Decision,
@@ -11,6 +13,8 @@ import type {
   RegisterProjectRequest,
   SessionContext,
   SyncSessionContextRequest,
+  SyncCodexDesktopSessionsRequest,
+  SyncCodexUsageRequest,
   TaskEvent,
   UpdateChatSessionRequest,
 } from "@codeassist/shared";
@@ -50,6 +54,10 @@ export class ApiClient {
 
   registerProject(input: RegisterProjectRequest): Promise<Project> {
     return this.request("POST", "/api/projects/register", input);
+  }
+
+  listProjects(): Promise<Project[]> {
+    return this.request("GET", "/api/projects");
   }
 
   heartbeat(projectId: string): Promise<Project> {
@@ -95,6 +103,28 @@ export class ApiClient {
     return this.request("POST", "/api/mcp/session-context", input);
   }
 
+  updateCodexUsage(
+    projectId: string,
+    input: Omit<SyncCodexUsageRequest, "projectId">,
+  ): Promise<CodexUsageSnapshot> {
+    return this.request(
+      "PUT",
+      `/api/mcp/codex-usage/${encodeURIComponent(projectId)}`,
+      input,
+    );
+  }
+
+  updateCodexDesktopSessions(
+    projectId: string,
+    input: SyncCodexDesktopSessionsRequest,
+  ): Promise<CodexDesktopSession[]> {
+    return this.request(
+      "PUT",
+      `/api/mcp/codex-sessions/${encodeURIComponent(projectId)}`,
+      input,
+    );
+  }
+
   getChatSession(id: string): Promise<ChatSession> {
     return this.request("GET", `/api/chat-sessions/${id}`);
   }
@@ -128,10 +158,10 @@ export class ApiClient {
   }
 
   claimOpenWorkspace(projectId: string): Promise<OpenWorkspaceCommand[]> {
-    return this.request(
+    return this.request<unknown>(
       "GET",
       `/api/mcp/open-workspace?projectId=${encodeURIComponent(projectId)}`,
-    );
+    ).then(normalizeOpenWorkspaceCommands);
   }
 
   completeOpenWorkspace(
@@ -144,4 +174,30 @@ export class ApiClient {
       error,
     });
   }
+}
+
+function normalizeOpenWorkspaceCommands(value: unknown): OpenWorkspaceCommand[] {
+  if (value == null) return [];
+  if (Array.isArray(value)) return value as OpenWorkspaceCommand[];
+  if (typeof value !== "object") {
+    throw new Error("Unexpected open-workspace response: expected an object or array");
+  }
+
+  const record = value as Record<string, unknown>;
+  for (const key of ["commands", "items", "data"]) {
+    const nested = record[key];
+    if (Array.isArray(nested)) return nested as OpenWorkspaceCommand[];
+    if (nested == null && key in record) return [];
+    if (nested && typeof nested === "object") {
+      const command = nested as Record<string, unknown>;
+      if (typeof command.id === "string") {
+        return [command as unknown as OpenWorkspaceCommand];
+      }
+    }
+  }
+
+  if (typeof record.id === "string") {
+    return [record as unknown as OpenWorkspaceCommand];
+  }
+  throw new Error("Unexpected open-workspace response: command list is missing");
 }

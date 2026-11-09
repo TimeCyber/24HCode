@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -14,6 +15,7 @@ import 'background_watch_service.dart';
 import 'ide_labels.dart';
 import 'models.dart';
 import 'notification_service.dart';
+import 'client_update_policy.dart';
 
 const _kBgNotifiedIds = 'bg_notified_prompt_ids';
 
@@ -35,7 +37,7 @@ class AttachmentDownloadState {
   bool get isBusy => status == AttachmentDownloadStatus.downloading;
 }
 
-class AppState extends ChangeNotifier {
+class AppState extends ChangeNotifier with WidgetsBindingObserver {
   static const _kUrl = 'server_url';
   static const _kApiRoot = 'api_root';
   static const _kToken = 'access_token';
@@ -45,11 +47,15 @@ class AppState extends ChangeNotifier {
   static const _kActiveChat = 'active_chat_session_id';
   static const _kConnMode = 'connection_mode';
   static const _kRecentWorkspaces = 'recent_workspace_paths';
+  static const _kScheduledPrompts = 'scheduled_prompts';
+  static const _kHiddenProjectIds = 'hidden_project_ids';
 
   /// `cloud` = mcp-x 账号登录；`lan` = 内网中继地址 + Token
   String connectionMode = 'cloud';
+
   /// CodeAssist 中继地址（云端 = apiRoot+/codeassist；内网 = 直接填 http://ip:8787）
   String serverUrl = '';
+
   /// RuoYi / mcp-x API 根，如 https://mcp-x.com/prod-api（仅云端模式）
   String apiRoot = 'https://mcp-x.com/prod-api';
   String token = '';
@@ -62,21 +68,39 @@ class AppState extends ChangeNotifier {
   String? error;
 
   List<Project> projects = [];
+  final Set<String> hiddenProjectIds = <String>{};
   List<String> recentWorkspacePaths = [];
+
+  List<Project> get visibleProjects => projects
+      .where((project) => !hiddenProjectIds.contains(project.id))
+      .toList();
+
+  List<Project> get hiddenProjects => projects
+      .where((project) => hiddenProjectIds.contains(project.id))
+      .toList();
+
+  bool isProjectHidden(String projectId) =>
+      hiddenProjectIds.contains(projectId);
+
   /// 附件下载状态（按 fileId），不绑在聊天气泡 State 上，避免滑动回收取消 UI
   final Map<String, AttachmentDownloadState> attachmentDownloads = {};
   List<TaskEvent> tasks = [];
   List<PromptJob> prompts = [];
   List<PromptJob> chatMessages = [];
+  List<ProjectActivity> projectActivities = [];
   List<ChatSession> chatSessions = [];
   List<SessionContext> sessions = [];
+  final Map<String, CodexUsageSnapshot> codexUsageByProject = {};
+
   /// 云端已配对的家里电脑；内网模式不使用
   List<Map<String, dynamic>> pairedDevices = [];
+
   /// 是否已成功拉取过配对列表（避免加载中误提示）
   bool pairedDevicesLoaded = false;
 
   String? activeProjectId;
   String? activeChatSessionId;
+  List<ScheduledPrompt> scheduledPrompts = [];
 
   ApiClient? _api;
   ApiClient? get apiOrNull => _api;
@@ -84,9 +108,38 @@ class AppState extends ChangeNotifier {
   StreamSubscription? _wsSub;
   Timer? _reconnectTimer;
   Timer? _progressPollTimer;
+  Timer? _scheduledPromptTimer;
+  bool _scheduledPromptsLoaded = false;
+  bool _scheduledPromptDispatching = false;
+  bool _appForeground = true;
   bool _disposed = false;
   final Set<String> _completionSoundPlayed = {};
   final Set<String> _taskNotifyPlayed = {};
+  StableProjectOrder _projectOrder = StableProjectOrder();
+  DateTime _taskConnectedAt = DateTime.now().toUtc();
+  String _clientScope = '';
+  Future<void> _persistOrder = Future<void>.value();
+  Future<void> _taskNotificationQueue = Future<void>.value();
+
+  void _setProjects(List<Project> input) {
+    projects = _projectOrder.merge(input);
+    final key = 'project_order_v1_$_clientScope';
+    final order = List<String>.of(_projectOrder.keys);
+    _persistOrder = _persistOrder
+        .catchError((Object _) {})
+        .then((_) async {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setStringList(key, order);
+        })
+        .catchError((Object _) {});
+  }
+
+  AppState() {
+    WidgetsBinding.instance.addObserver(this);
+    _appForeground =
+        WidgetsBinding.instance.lifecycleState == null ||
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+  }
 
   Project? get activeProject {
     final id = activeProjectId;
@@ -98,26 +151,40 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  CodexUsageSnapshot? get activeCodexUsage {
+    final id = activeProjectId;
+    return id == null ? null : codexUsageByProject[id];
+  }
+
+  List<ProjectActivity> get recentOtherProjectActivities {
+    final cutoff = DateTime.now().toUtc().subtract(const Duration(hours: 24));
+    final items = projectActivities.where((activity) {
+      if (hiddenProjectIds.contains(activity.projectId)) return false;
+      if (activity.projectId == activeProjectId) return false;
+      if (activity.status == 'queued' ||
+          activity.status == 'delivered' ||
+          activity.status == 'running') {
+        return true;
+      }
+      try {
+        return DateTime.parse(activity.updatedAt).toUtc().isAfter(cutoff);
+      } catch (_) {
+        return false;
+      }
+    }).toList()..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return items.take(5).toList();
+  }
+
   /// 云端已登录但尚未绑定电脑：首页应引导去「设备配对」
   bool get needsDevicePairing =>
       isCloudMode && pairedDevicesLoaded && pairedDevices.isEmpty;
 
   /// Windows 路径大小写不同会产生重复「离线项目」，按规范化路径去重。
-  static String _normPath(String p) =>
-      p.trim().replaceAll('\\', '/').replaceAll(RegExp(r'/+$'), '').toLowerCase();
-
-  static List<Project> _dedupeProjects(List<Project> input) {
-    final seen = <String>{};
-    final out = <Project>[];
-    // 已按 lastSeen 倒序时，先到的优先（在线/更新的在前）
-    for (final p in input) {
-      final key = '${p.ide}::${_normPath(p.workspacePath)}';
-      if (seen.contains(key)) continue;
-      seen.add(key);
-      out.add(p);
-    }
-    return out;
-  }
+  static String _normPath(String p) => p
+      .trim()
+      .replaceAll('\\', '/')
+      .replaceAll(RegExp(r'/+$'), '')
+      .toLowerCase();
 
   ChatSession? get activeChatSession {
     final id = activeChatSessionId;
@@ -130,6 +197,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> loadConfig() async {
+    await _loadScheduledPrompts();
     final prefs = await SharedPreferences.getInstance();
     apiRoot = prefs.getString(_kApiRoot) ?? apiRoot;
     token = prefs.getString(_kToken) ?? token;
@@ -137,6 +205,9 @@ class AppState extends ChangeNotifier {
     nickName = prefs.getString(_kNickName) ?? '';
     activeProjectId = prefs.getString(_kActiveProject);
     activeChatSessionId = prefs.getString(_kActiveChat);
+    hiddenProjectIds
+      ..clear()
+      ..addAll(prefs.getStringList(_kHiddenProjectIds) ?? const <String>[]);
     recentWorkspacePaths = prefs.getStringList(_kRecentWorkspaces) ?? [];
 
     final savedUrl = prefs.getString(_kUrl);
@@ -152,7 +223,8 @@ class AppState extends ChangeNotifier {
     } else {
       // 兼容旧配置：无 /codeassist 且像 host:port → 内网
       final u = serverUrl.toLowerCase();
-      final looksLan = u.isNotEmpty &&
+      final looksLan =
+          u.isNotEmpty &&
           !u.contains('/codeassist') &&
           (u.contains('192.168.') ||
               u.contains('10.') ||
@@ -223,6 +295,8 @@ class AppState extends ChangeNotifier {
     _ws = null;
     _reconnectTimer?.cancel();
     _progressPollTimer?.cancel();
+    _scheduledPromptTimer?.cancel();
+    _scheduledPromptTimer = null;
     _api = null;
 
     token = '';
@@ -236,6 +310,7 @@ class AppState extends ChangeNotifier {
     chatMessages = [];
     chatSessions = [];
     sessions = [];
+    codexUsageByProject.clear();
     pairedDevices = [];
     pairedDevicesLoaded = false;
     activeProjectId = null;
@@ -338,9 +413,20 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     _api = ApiClient(baseUrl: serverUrl, token: token);
     try {
+      final scope = Uri.encodeComponent('$serverUrl|$username');
+      if (_clientScope != scope) {
+        _clientScope = scope;
+        final prefs = await SharedPreferences.getInstance();
+        _projectOrder = StableProjectOrder(
+          prefs.getStringList('project_order_v1_$scope') ?? const [],
+        );
+        _taskNotifyPlayed.clear();
+      }
+      _taskConnectedAt = DateTime.now().toUtc();
       await refreshAll();
       _connectWs();
       _ensureProgressPolling();
+      _syncScheduledPromptTimer();
       connecting = false;
       notifyListeners();
     } catch (e) {
@@ -373,10 +459,15 @@ class AppState extends ChangeNotifier {
     if (api == null) return;
     final errors = <String>[];
     try {
-      projects = _dedupeProjects(await api.listProjects());
+      _setProjects(await api.listProjects());
     } catch (e) {
-      projects = [];
+      // Preserve rows during transient refresh failures.
       errors.add('项目: $e');
+    }
+    try {
+      projectActivities = await api.listRecentProjectActivity();
+    } catch (_) {
+      // 旧中继版本暂不支持快照时，实时事件仍可更新项目状态。
     }
     try {
       tasks = await api.listTasks();
@@ -404,20 +495,24 @@ class AppState extends ChangeNotifier {
     }
 
     if (activeProjectId == null ||
-        !projects.any((p) => p.id == activeProjectId)) {
-      final online = projects.where((p) => p.isEffectivelyOnline()).toList();
+        !visibleProjects.any((p) => p.id == activeProjectId)) {
+      final candidates = visibleProjects;
+      final online = candidates.where((p) => p.isEffectivelyOnline()).toList();
       activeProjectId = online.isNotEmpty
           ? online.first.id
-          : (projects.isNotEmpty ? projects.first.id : null);
+          : (candidates.isNotEmpty ? candidates.first.id : null);
     }
+
+    codexUsageByProject.removeWhere(
+      (projectId, _) => !projects.any((project) => project.id == projectId),
+    );
+    await refreshCodexUsage();
 
     await _loadChatSessionsForActiveProject();
     await _loadMessagesForActiveChat();
     await _persistSelection();
     // 仅当项目都拉失败时把错误顶到首页；上下文缺表只记日志不挡操作
-    error = errors.isNotEmpty && projects.isEmpty
-        ? errors.join('\n')
-        : null;
+    error = errors.isNotEmpty && projects.isEmpty ? errors.join('\n') : null;
     notifyListeners();
   }
 
@@ -446,11 +541,11 @@ class AppState extends ChangeNotifier {
     _loadingSessions = true;
     try {
       // 服务端会 prune 空的同名重复会话（项目合并后常见）
-      chatSessions =
-          _dedupeSessions(await api.listChatSessions(projectId: projectId));
+      chatSessions = _dedupeSessions(
+        await api.listChatSessions(projectId: projectId),
+      );
       if (chatSessions.isEmpty) {
-        final created =
-            await api.createChatSession(projectId, title: '默认会话');
+        final created = await api.createChatSession(projectId, title: '默认会话');
         chatSessions = [created];
         activeChatSessionId = created.id;
         return;
@@ -515,8 +610,7 @@ class AppState extends ChangeNotifier {
     final list = prefs.getStringList(_kBgNotifiedIds) ?? [];
     if (list.contains(id)) return;
     list.add(id);
-    final trimmed =
-        list.length > 200 ? list.sublist(list.length - 200) : list;
+    final trimmed = list.length > 200 ? list.sublist(list.length - 200) : list;
     await prefs.setStringList(_kBgNotifiedIds, trimmed);
   }
 
@@ -568,29 +662,42 @@ class AppState extends ChangeNotifier {
     }());
   }
 
-  String _activeIdeLabel() =>
-      activeProject?.ideLabel ?? kGenericIdeLabel;
+  String _activeIdeLabel() => activeProject?.ideLabel ?? kGenericIdeLabel;
 
   void _maybeNotifyTaskEvent(TaskEvent? old, TaskEvent next) {
-    final completed = next.type == 'completed' || next.status == 'completed';
-    if (!completed) return;
-    if (old != null &&
-        (old.type == 'completed' || old.status == 'completed')) {
-      return;
-    }
+    if (!shouldNotifyTask(old, next, _taskConnectedAt)) return;
     if (_taskNotifyPlayed.contains(next.id)) return;
     _taskNotifyPlayed.add(next.id);
-    _playCompletionSound();
     final detail = next.detail.trim();
     final body = detail.isEmpty
         ? next.title
         : '${next.title}\n${detail.length > 100 ? '${detail.substring(0, 100)}…' : detail}';
-    unawaited(
-      NotificationService.instance.showTaskCompleted(
-        title: '${_activeIdeLabel()} 任务完成',
-        body: body,
-      ),
-    );
+    final receiptKey = 'task_notified_v1_$_clientScope';
+    final title = '${_activeIdeLabel()} 任务完成';
+    _taskNotificationQueue = _taskNotificationQueue.catchError((Object _) {}).then((
+      _,
+    ) async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final receipts = prefs.getStringList(receiptKey) ?? <String>[];
+        if (receipts.contains(next.id)) return;
+        // Persist before sending, so a restart cannot replay a delivered alert.
+        receipts.add(next.id);
+        await prefs.setStringList(
+          receiptKey,
+          receipts.length > 1000
+              ? receipts.sublist(receipts.length - 1000)
+              : receipts,
+        );
+        await NotificationService.instance.showTaskCompleted(
+          title: title,
+          body: body,
+        );
+      } catch (_) {
+        // A future live transition may retry if persistence failed.
+        _taskNotifyPlayed.remove(next.id);
+      }
+    });
   }
 
   void _notifyPromptCompletions(
@@ -607,11 +714,67 @@ class AppState extends ChangeNotifier {
     if (activeProjectId == projectId) return;
     activeProjectId = projectId;
     activeChatSessionId = null;
+    await refreshCodexUsage(projectId);
     await _loadChatSessionsForActiveProject();
     await _loadMessagesForActiveChat();
     await _persistSelection();
     _sendSubscribe();
     notifyListeners();
+  }
+
+  Future<void> setProjectHidden(String projectId, bool hidden) async {
+    if (!projects.any((project) => project.id == projectId)) return;
+    final changed = hidden
+        ? hiddenProjectIds.add(projectId)
+        : hiddenProjectIds.remove(projectId);
+    if (!changed) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      _kHiddenProjectIds,
+      hiddenProjectIds.toList()..sort(),
+    );
+
+    if (hidden && activeProjectId == projectId) {
+      final candidates = visibleProjects;
+      final online = candidates.where((p) => p.isEffectivelyOnline()).toList();
+      activeProjectId = online.isNotEmpty
+          ? online.first.id
+          : (candidates.isNotEmpty ? candidates.first.id : null);
+      activeChatSessionId = null;
+      chatSessions = [];
+      chatMessages = [];
+      await refreshCodexUsage();
+      await _loadChatSessionsForActiveProject();
+      await _loadMessagesForActiveChat();
+      await _persistSelection();
+      _sendSubscribe();
+    }
+    notifyListeners();
+  }
+
+  Future<void> refreshCodexUsage([String? projectId]) async {
+    final api = _api;
+    final id = projectId ?? activeProjectId;
+    if (id == null) return;
+    final matching = projects.where((item) => item.id == id);
+    final project = matching.isEmpty ? null : matching.first;
+    if (project == null || project.ide != 'codex') {
+      codexUsageByProject.remove(id);
+      return;
+    }
+    if (api == null) return;
+    try {
+      final usage = await api.getCodexUsage(id);
+      if (usage == null) {
+        codexUsageByProject.remove(id);
+      } else {
+        codexUsageByProject[id] = usage;
+      }
+      notifyListeners();
+    } catch (_) {
+      // Older relays may not expose this optional endpoint; keep the last value.
+    }
   }
 
   Future<void> _rememberWorkspacePath(String path) async {
@@ -644,8 +807,7 @@ class AppState extends ChangeNotifier {
           ? activeProjectId
           : matchIde.first.id;
     } else {
-      final anyOnline =
-          projects.where((p) => p.isEffectivelyOnline()).toList();
+      final anyOnline = projects.where((p) => p.isEffectivelyOnline()).toList();
       if (anyOnline.isNotEmpty) via = anyOnline.first.id;
     }
 
@@ -729,6 +891,49 @@ class AppState extends ChangeNotifier {
     return session;
   }
 
+  Future<List<CodexDesktopSession>> fetchCodexDesktopSessions() async {
+    final project = activeProject;
+    final api = _api;
+    if (project == null || api == null) {
+      throw Exception('请先选择 Codex 项目');
+    }
+    if (project.ide != 'codex') {
+      throw Exception('只有 Codex 项目支持继续 PC Session');
+    }
+    return api.listCodexDesktopSessions(project.id);
+  }
+
+  Future<void> continueCodexDesktopSession(
+    CodexDesktopSession pcSession,
+  ) async {
+    final project = activeProject;
+    final api = _api;
+    if (project == null || api == null) {
+      throw Exception('请先选择 Codex 项目');
+    }
+    final existing = chatSessions.where(
+      (session) => session.cursorChatId == pcSession.id,
+    );
+    if (existing.isNotEmpty) {
+      await selectChatSession(existing.first.id);
+      return;
+    }
+
+    final title = 'PC · ${pcSession.title}';
+    final created = await api.createChatSession(
+      project.id,
+      title: title.length > 120 ? title.substring(0, 120) : title,
+    );
+    await api.updateChatSession(created.id, cursorChatId: pcSession.id);
+    chatSessions = _dedupeSessions(
+      await api.listChatSessions(projectId: project.id),
+    );
+    activeChatSessionId = created.id;
+    chatMessages = [];
+    await _persistSelection();
+    notifyListeners();
+  }
+
   Future<void> approveTask(String taskId, {String? comment}) async {
     await _api?.submitDecision(taskId, 'approve', comment: comment);
     await refreshAll();
@@ -757,6 +962,167 @@ class AppState extends ChangeNotifier {
     await _loadMessagesForActiveChat();
     _ensureProgressPolling();
     notifyListeners();
+  }
+
+  Future<void> _loadScheduledPrompts() async {
+    if (_scheduledPromptsLoaded) return;
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kScheduledPrompts);
+    if (raw != null) {
+      try {
+        final values = jsonDecode(raw) as List<dynamic>;
+        scheduledPrompts = values
+            .map(
+              (value) =>
+                  ScheduledPrompt.fromJson(value as Map<String, dynamic>),
+            )
+            .toList();
+      } catch (_) {
+        scheduledPrompts = [];
+      }
+    }
+    _scheduledPromptsLoaded = true;
+    _syncScheduledPromptTimer();
+  }
+
+  Future<void> _persistScheduledPrompts() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _kScheduledPrompts,
+      jsonEncode(scheduledPrompts.map((item) => item.toJson()).toList()),
+    );
+  }
+
+  Future<void> addScheduledPrompt({
+    required String prompt,
+    required String projectId,
+    required int intervalMinutes,
+  }) async {
+    await _loadScheduledPrompts();
+    final item = ScheduledPrompt(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      projectId: projectId,
+      prompt: prompt.trim(),
+      intervalMinutes: intervalMinutes,
+      nextRunAt: DateTime.now().add(Duration(minutes: intervalMinutes)),
+    );
+    scheduledPrompts = [item, ...scheduledPrompts];
+    await _persistScheduledPrompts();
+    _syncScheduledPromptTimer();
+    notifyListeners();
+  }
+
+  Future<void> setScheduledPromptEnabled(String id, bool enabled) async {
+    final index = scheduledPrompts.indexWhere((item) => item.id == id);
+    if (index < 0) return;
+    final item = scheduledPrompts[index];
+    final updated = item.copyWith(
+      enabled: enabled,
+      nextRunAt: enabled
+          ? DateTime.now().add(Duration(minutes: item.intervalMinutes))
+          : item.nextRunAt,
+      clearLastError: true,
+    );
+    scheduledPrompts = [...scheduledPrompts]..[index] = updated;
+    await _persistScheduledPrompts();
+    _syncScheduledPromptTimer();
+    notifyListeners();
+  }
+
+  Future<void> removeScheduledPrompt(String id) async {
+    scheduledPrompts = scheduledPrompts.where((item) => item.id != id).toList();
+    await _persistScheduledPrompts();
+    _syncScheduledPromptTimer();
+    notifyListeners();
+  }
+
+  void _syncScheduledPromptTimer() {
+    final shouldRun =
+        !_disposed &&
+        _scheduledPromptsLoaded &&
+        _appForeground &&
+        configured &&
+        _api != null &&
+        scheduledPrompts.any((item) => item.enabled);
+    if (!shouldRun) {
+      _scheduledPromptTimer?.cancel();
+      _scheduledPromptTimer = null;
+      return;
+    }
+    if (_scheduledPromptTimer != null) return;
+    _scheduledPromptTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      unawaited(_dispatchDueScheduledPrompts());
+    });
+    unawaited(_dispatchDueScheduledPrompts());
+  }
+
+  Future<void> _dispatchDueScheduledPrompts() async {
+    final api = _api;
+    if (_scheduledPromptDispatching ||
+        !_appForeground ||
+        !configured ||
+        api == null) {
+      return;
+    }
+    final now = DateTime.now();
+    final due = scheduledPrompts
+        .where((item) => item.enabled && !item.nextRunAt.isAfter(now))
+        .toList();
+    if (due.isEmpty) return;
+
+    _scheduledPromptDispatching = true;
+    try {
+      for (final item in due) {
+        if (!_appForeground || _api != api) break;
+        final index = scheduledPrompts.indexWhere(
+          (current) =>
+              current.id == item.id &&
+              current.enabled &&
+              !current.nextRunAt.isAfter(DateTime.now()),
+        );
+        if (index < 0) continue;
+
+        final attemptedAt = DateTime.now();
+        final updated = item.copyWith(
+          nextRunAt: attemptedAt.add(Duration(minutes: item.intervalMinutes)),
+          lastRunAt: attemptedAt,
+          clearLastError: true,
+        );
+        scheduledPrompts = [...scheduledPrompts]..[index] = updated;
+        await _persistScheduledPrompts();
+        notifyListeners();
+
+        try {
+          await api.createPrompt(
+            content: item.prompt,
+            projectId: item.projectId,
+          );
+          if (activeProjectId == item.projectId) {
+            unawaited(_onPromptUpdated());
+          }
+        } catch (error) {
+          final currentIndex = scheduledPrompts.indexWhere(
+            (current) => current.id == item.id,
+          );
+          if (currentIndex >= 0) {
+            scheduledPrompts = [...scheduledPrompts]
+              ..[currentIndex] = scheduledPrompts[currentIndex].copyWith(
+                lastError: error.toString().replaceFirst('Exception: ', ''),
+              );
+            await _persistScheduledPrompts();
+            notifyListeners();
+          }
+        }
+      }
+    } finally {
+      _scheduledPromptDispatching = false;
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appForeground = state == AppLifecycleState.resumed;
+    _syncScheduledPromptTimer();
   }
 
   Future<List<int>> downloadAttachmentBytes(String fileId) async {
@@ -885,11 +1251,8 @@ class AppState extends ChangeNotifier {
   }
 
   void _sendSubscribe() {
-    final ids = activeProjectId == null ? null : [activeProjectId!];
-    _ws?.sink.add(jsonEncode({
-      'type': 'subscribe',
-      if (ids != null) 'projectIds': ids,
-    }));
+    // 项目动态需要同时接收其他工作区的 prompt.updated 事件。
+    _ws?.sink.add(jsonEncode({'type': 'subscribe'}));
   }
 
   void _onWsMessage(dynamic raw) {
@@ -918,10 +1281,10 @@ class AppState extends ChangeNotifier {
               next[pathIdx] = p;
               projects = next;
             } else {
-              projects = [p, ...projects];
+              projects = [...projects, p];
             }
           }
-          projects = _dedupeProjects(projects);
+          _setProjects(projects);
           notifyListeners();
           break;
         case 'task.created':
@@ -938,8 +1301,13 @@ class AppState extends ChangeNotifier {
           notifyListeners();
           break;
         case 'prompt.updated':
-          _applyPromptDeliveryPayload(payload);
-          unawaited(_onPromptUpdated());
+          _upsertProjectActivity(payload);
+          if (payload['projectId'] == activeProjectId) {
+            _applyPromptDeliveryPayload(payload);
+            unawaited(_onPromptUpdated());
+          } else {
+            notifyListeners();
+          }
           break;
         case 'chat.session.updated':
           final s = ChatSession.fromJson(payload);
@@ -955,11 +1323,13 @@ class AppState extends ChangeNotifier {
           if (deletedId != null &&
               (deletedProjectId == null ||
                   deletedProjectId == activeProjectId)) {
-            chatSessions =
-                chatSessions.where((s) => s.id != deletedId).toList();
+            chatSessions = chatSessions
+                .where((s) => s.id != deletedId)
+                .toList();
             if (activeChatSessionId == deletedId) {
-              activeChatSessionId =
-                  chatSessions.isNotEmpty ? chatSessions.first.id : null;
+              activeChatSessionId = chatSessions.isNotEmpty
+                  ? chatSessions.first.id
+                  : null;
               unawaited(_loadMessagesForActiveChat());
             }
             notifyListeners();
@@ -975,12 +1345,48 @@ class AppState extends ChangeNotifier {
           }
           notifyListeners();
           break;
+        case 'codex.usage.updated':
+          final usage = CodexUsageSnapshot.fromJson(payload);
+          codexUsageByProject[usage.projectId] = usage;
+          notifyListeners();
+          break;
         default:
           break;
       }
     } catch (_) {
       // ignore malformed
     }
+  }
+
+  void _upsertProjectActivity(Map<String, dynamic> payload) {
+    final promptId = payload['promptId'] as String?;
+    final projectId = payload['projectId'] as String?;
+    final status = payload['status'] as String?;
+    if (promptId == null || projectId == null || status == null) return;
+
+    final key = '$projectId:$promptId';
+    final previousItems = projectActivities
+        .where((item) => '${item.projectId}:${item.promptId}' == key)
+        .toList();
+    final previous = previousItems.isEmpty ? null : previousItems.first;
+    final items = projectActivities
+        .where((item) => '${item.projectId}:${item.promptId}' != key)
+        .toList();
+    items.insert(
+      0,
+      ProjectActivity(
+        id: payload['id'] as String? ?? previous?.id ?? promptId,
+        promptId: promptId,
+        projectId: projectId,
+        content: payload['content'] as String? ?? previous?.content ?? '',
+        status: status,
+        updatedAt:
+            payload['updatedAt'] as String? ??
+            DateTime.now().toUtc().toIso8601String(),
+        result: payload['result'] as String? ?? previous?.result,
+      ),
+    );
+    projectActivities = items.take(100).toList();
   }
 
   void _applyPromptDeliveryPayload(Map<String, dynamic> payload) {
@@ -1030,25 +1436,26 @@ class AppState extends ChangeNotifier {
   }
 
   bool get _hasInFlightMessages => chatMessages.any((m) {
-        if (m.status == 'done' || m.status == 'failed') return false;
-        // 已有结果则视为完成，避免前台服务一直「监听中」
-        if (m.result != null && m.result!.trim().isNotEmpty) return false;
-        return m.status == 'queued' ||
-            m.status == 'delivered' ||
-            m.status == 'running';
-      });
+    if (m.status == 'done' || m.status == 'failed') return false;
+    // 已有结果则视为完成，避免前台服务一直「监听中」
+    if (m.result != null && m.result!.trim().isNotEmpty) return false;
+    return m.status == 'queued' ||
+        m.status == 'delivered' ||
+        m.status == 'running';
+  });
 
   void _ensureProgressPolling() {
     unawaited(() async {
       if (_hasInFlightMessages) {
         await BackgroundWatchService.seedWatchingIds(
           chatMessages
-              .where((m) =>
-                  m.status == 'queued' ||
-                  m.status == 'delivered' ||
-                  m.status == 'running')
-              .where((m) =>
-                  m.result == null || m.result!.trim().isEmpty)
+              .where(
+                (m) =>
+                    m.status == 'queued' ||
+                    m.status == 'delivered' ||
+                    m.status == 'running',
+              )
+              .where((m) => m.result == null || m.result!.trim().isEmpty)
               .map((m) => m.id),
         );
       }
@@ -1062,8 +1469,7 @@ class AppState extends ChangeNotifier {
       return;
     }
     if (_progressPollTimer != null) return;
-    _progressPollTimer =
-        Timer.periodic(const Duration(seconds: 2), (_) async {
+    _progressPollTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
       if (_disposed || !_hasInFlightMessages) {
         _progressPollTimer?.cancel();
         _progressPollTimer = null;
@@ -1073,8 +1479,9 @@ class AppState extends ChangeNotifier {
       try {
         await _loadMessagesForActiveChat();
         if (activeProjectId != null && _api != null) {
-          chatSessions =
-              await _api!.listChatSessions(projectId: activeProjectId);
+          chatSessions = await _api!.listChatSessions(
+            projectId: activeProjectId,
+          );
         }
         notifyListeners();
         if (!_hasInFlightMessages) {
@@ -1099,8 +1506,10 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     _reconnectTimer?.cancel();
     _progressPollTimer?.cancel();
+    _scheduledPromptTimer?.cancel();
     _wsSub?.cancel();
     _ws?.sink.close();
     super.dispose();

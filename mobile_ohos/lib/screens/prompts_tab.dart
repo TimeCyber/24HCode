@@ -29,6 +29,9 @@ class _PromptsTabState extends State<PromptsTab> {
   bool _sending = false;
   bool _hasText = false;
   bool _projectPickerOpen = false;
+  Uint8List? _pendingImageBytes;
+  String? _pendingImageName;
+  String? _pendingImageMime;
 
   @override
   void initState() {
@@ -68,18 +71,36 @@ class _PromptsTabState extends State<PromptsTab> {
 
   Future<void> _send() async {
     final content = _controller.text.trim();
-    if (content.isEmpty || _sending) return;
+    final imageBytes = _pendingImageBytes;
+    if ((content.isEmpty && imageBytes == null) || _sending) return;
     _focusNode.unfocus();
     setState(() => _sending = true);
     try {
-      await context.read<AppState>().sendPrompt(content);
+      final state = context.read<AppState>();
+      if (imageBytes != null) {
+        await state.sendImageToAgent(
+          fileName:
+              _pendingImageName ??
+              'photo_${DateTime.now().millisecondsSinceEpoch}.jpg',
+          bytes: imageBytes,
+          mimeType: _pendingImageMime,
+          message: content.isEmpty ? null : content,
+        );
+        setState(() {
+          _pendingImageBytes = null;
+          _pendingImageName = null;
+          _pendingImageMime = null;
+        });
+      } else {
+        await state.sendPrompt(content);
+      }
       _controller.clear();
       _scrollToLatest();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.toString())),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     } finally {
       if (mounted) setState(() => _sending = false);
@@ -95,90 +116,146 @@ class _PromptsTabState extends State<PromptsTab> {
     try {
       if (!mounted) return;
       await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) {
-        return Consumer<AppState>(
-          builder: (context, s, _) {
-            return SafeArea(
-              child: SizedBox(
-                height: MediaQuery.of(ctx).size.height * 0.65,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 16, 8, 8),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              '连接 / 选择 AI 项目',
-                              style: Theme.of(ctx).textTheme.titleMedium,
+        context: context,
+        isScrollControlled: true,
+        builder: (ctx) {
+          return Consumer<AppState>(
+            builder: (context, s, _) {
+              final visibleProjects = s.visibleProjects;
+              final hiddenProjects = s.hiddenProjects;
+              return SafeArea(
+                child: SizedBox(
+                  height: MediaQuery.of(ctx).size.height * 0.65,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 16, 8, 8),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '连接 / 选择 AI 项目',
+                                style: Theme.of(ctx).textTheme.titleMedium,
+                              ),
                             ),
-                          ),
-                          IconButton(
-                            tooltip: '刷新项目列表',
-                            onPressed: () => s.refreshAll(),
-                            icon: const Icon(Icons.refresh),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        '在 PC 上打开工作区并启用 MCP（Cursor / Codex / Trae / WorkBuddy 等）后，项目会出现在这里。对话按项目隔离。',
-                        style: Theme.of(ctx).textTheme.bodySmall,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Expanded(
-                      child: s.projects.isEmpty
-                          ? const Center(
-                              child: Text('暂无项目，请先在 PC 打开 AI 工具并启用 MCP'),
-                            )
-                          : ListView.separated(
-                              itemCount: s.projects.length,
-                              separatorBuilder: (_, __) =>
-                                  const Divider(height: 1),
-                              itemBuilder: (_, i) {
-                                final p = s.projects[i];
-                                final selected = s.activeProjectId == p.id;
-                                return ListTile(
-                                  selected: selected,
-                                  leading: Icon(
-                                    Icons.circle,
-                                    size: 12,
-                                    color:
-                                        p.isEffectivelyOnline()
-                                            ? Colors.green
-                                            : Colors.grey,
-                                  ),
-                                  title: Text(p.displayName),
-                                  subtitle: Text(
-                                    '${p.isEffectivelyOnline() ? '在线' : '离线'} · ${p.ideLabel} · ${p.workspacePath}',
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                  trailing: selected
-                                      ? const Icon(Icons.check)
-                                      : null,
-                                  onTap: () async {
-                                    await s.selectProject(p.id);
-                                    if (ctx.mounted) Navigator.pop(ctx);
-                                  },
-                                );
-                              },
+                            IconButton(
+                              tooltip: '刷新项目列表',
+                              onPressed: () => s.refreshAll(),
+                              icon: const Icon(Icons.refresh),
                             ),
-                    ),
-                  ],
+                          ],
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        child: Text(
+                          '在 PC 上打开工作区并启用 MCP 后，项目会出现在这里。同一工作区若在多个 AI 工具中在线，会分别列出。隐藏只影响这台手机的显示。',
+                          style: Theme.of(ctx).textTheme.bodySmall,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: s.projects.isEmpty
+                            ? const Center(
+                                child: Text('暂无项目，请先在 PC 打开 AI 工具并启用 MCP'),
+                              )
+                            : ListView.separated(
+                                itemCount:
+                                    visibleProjects.length +
+                                    (hiddenProjects.isEmpty ? 0 : 1),
+                                separatorBuilder: (_, _) =>
+                                    const Divider(height: 1),
+                                itemBuilder: (_, i) {
+                                  if (i == visibleProjects.length &&
+                                      hiddenProjects.isNotEmpty) {
+                                    return ExpansionTile(
+                                      leading: const Icon(
+                                        Icons.visibility_off_outlined,
+                                      ),
+                                      title: Text(
+                                        '已隐藏项目（${hiddenProjects.length}）',
+                                      ),
+                                      children: [
+                                        for (final p in hiddenProjects)
+                                          ListTile(
+                                            leading: const Icon(
+                                              Icons.visibility_off_outlined,
+                                            ),
+                                            title: Text(p.displayName),
+                                            subtitle: Text(
+                                              '${p.ideLabel} · ${p.workspacePath}',
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                            trailing: IconButton(
+                                              tooltip: '恢复显示',
+                                              onPressed: () =>
+                                                  s.setProjectHidden(
+                                                    p.id,
+                                                    false,
+                                                  ),
+                                              icon: const Icon(
+                                                Icons.visibility_outlined,
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    );
+                                  }
+                                  final p = visibleProjects[i];
+                                  final selected = s.activeProjectId == p.id;
+                                  return ListTile(
+                                    selected: selected,
+                                    leading: Icon(
+                                      Icons.circle,
+                                      size: 12,
+                                      color: p.isEffectivelyOnline()
+                                          ? Colors.green
+                                          : Colors.grey,
+                                    ),
+                                    title: Text(p.displayName),
+                                    subtitle: Text(
+                                      '${p.isEffectivelyOnline() ? '在线' : '离线'} · ${p.ideLabel} · ${p.workspacePath}',
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    trailing: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        if (selected) const Icon(Icons.check),
+                                        PopupMenuButton<String>(
+                                          tooltip: '项目显示选项',
+                                          onSelected: (value) {
+                                            if (value == 'hide') {
+                                              s.setProjectHidden(p.id, true);
+                                            }
+                                          },
+                                          itemBuilder: (_) => const [
+                                            PopupMenuItem(
+                                              value: 'hide',
+                                              child: Text('在手机端隐藏'),
+                                            ),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                    onTap: () async {
+                                      await s.selectProject(p.id);
+                                      if (ctx.mounted) Navigator.pop(ctx);
+                                    },
+                                  );
+                                },
+                              ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            );
-          },
-        );
-      },
-    );
+              );
+            },
+          );
+        },
+      );
     } finally {
       _projectPickerOpen = false;
     }
@@ -194,11 +271,123 @@ class _PromptsTabState extends State<PromptsTab> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.toString())),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
+  }
+
+  Future<void> _openCodexDesktopSessions() async {
+    final state = context.read<AppState>();
+    final messenger = ScaffoldMessenger.of(context);
+    final sessionsFuture = state.fetchCodexDesktopSessions();
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.of(sheetContext).size.height * 0.72,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                child: Text(
+                  '继续 PC Codex 会话',
+                  style: Theme.of(sheetContext).textTheme.titleMedium,
+                ),
+              ),
+              Expanded(
+                child: FutureBuilder<List<CodexDesktopSession>>(
+                  future: sessionsFuture,
+                  builder: (context, snapshot) {
+                    if (snapshot.hasError) {
+                      return Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Text('读取 PC 会话失败：${snapshot.error}'),
+                        ),
+                      );
+                    }
+                    if (!snapshot.hasData) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+                    final pcSessions = snapshot.data!;
+                    if (pcSessions.isEmpty) {
+                      return const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(24),
+                          child: Text(
+                            '暂无可续聊的 PC 会话。请确认 PC 端 Codex 与 CodeAssist bridge 在线，再重新打开此列表。',
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      );
+                    }
+                    return ListView.separated(
+                      itemCount: pcSessions.length,
+                      separatorBuilder: (context, index) =>
+                          const Divider(height: 1),
+                      itemBuilder: (_, index) {
+                        final session = pcSessions[index];
+                        final updated = session.updatedAt > 0
+                            ? DateTime.fromMillisecondsSinceEpoch(
+                                session.updatedAt * 1000,
+                              ).toLocal()
+                            : null;
+                        final updatedLabel = updated == null
+                            ? ''
+                            : '${updated.year}-${updated.month.toString().padLeft(2, '0')}-${updated.day.toString().padLeft(2, '0')} ${updated.hour.toString().padLeft(2, '0')}:${updated.minute.toString().padLeft(2, '0')}';
+                        final preview = session.preview?.trim();
+                        final sourceLabel = switch (session.source) {
+                          'vscode' => 'Codex 桌面',
+                          'appServer' => 'Codex App Server',
+                          'cli' => 'Codex CLI',
+                          'exec' => 'Codex exec',
+                          _ => 'PC Codex',
+                        };
+                        return ListTile(
+                          leading: const Icon(Icons.computer_outlined),
+                          title: Text(
+                            session.title,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: Text(
+                            [
+                              if (preview != null && preview.isNotEmpty)
+                                preview,
+                              '$sourceLabel · $updatedLabel',
+                            ].join('\n'),
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          onTap: () async {
+                            try {
+                              await state.continueCodexDesktopSession(session);
+                              if (sheetContext.mounted) {
+                                Navigator.pop(sheetContext);
+                              }
+                            } catch (e) {
+                              if (mounted) {
+                                messenger.showSnackBar(
+                                  SnackBar(content: Text(e.toString())),
+                                );
+                              }
+                            }
+                          },
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _confirmDeleteSession(ChatSession session) async {
@@ -223,20 +412,20 @@ class _PromptsTabState extends State<PromptsTab> {
     try {
       await context.read<AppState>().deleteChatSession(session.id);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已删除「${session.title}」')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('已删除「${session.title}」')));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('删除失败：$e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('删除失败：$e')));
       }
     }
   }
 
-  Future<void> _pickAndSendImage(ImageSource source) async {
+  Future<void> _pickImage(ImageSource source) async {
     final project = context.read<AppState>().activeProject;
     if (project == null || _sending) return;
     final picker = ImagePicker();
@@ -248,31 +437,26 @@ class _PromptsTabState extends State<PromptsTab> {
     );
     if (picked == null || !mounted) return;
 
-    setState(() => _sending = true);
     try {
       final bytes = await picked.readAsBytes();
+      if (bytes.isEmpty) throw Exception('图片为空');
       final name = picked.name.trim().isNotEmpty
           ? picked.name
           : 'photo_${DateTime.now().millisecondsSinceEpoch}.jpg';
-      final mime = picked.mimeType ??
+      final mime =
+          picked.mimeType ??
           (name.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg');
-      final caption = _controller.text.trim();
-      await context.read<AppState>().sendImageToAgent(
-            fileName: name,
-            bytes: bytes,
-            mimeType: mime,
-            message: caption.isEmpty ? null : caption,
-          );
-      _controller.clear();
-      _scrollToLatest();
+      setState(() {
+        _pendingImageBytes = Uint8List.fromList(bytes);
+        _pendingImageName = name;
+        _pendingImageMime = mime;
+      });
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('发送图片失败：$e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('读取图片失败：$e')));
       }
-    } finally {
-      if (mounted) setState(() => _sending = false);
     }
   }
 
@@ -290,7 +474,7 @@ class _PromptsTabState extends State<PromptsTab> {
                 title: const Text('从相册选择'),
                 onTap: () {
                   Navigator.pop(ctx);
-                  unawaited(_pickAndSendImage(ImageSource.gallery));
+                  unawaited(_pickImage(ImageSource.gallery));
                 },
               ),
               ListTile(
@@ -298,7 +482,7 @@ class _PromptsTabState extends State<PromptsTab> {
                 title: const Text('拍照'),
                 onTap: () {
                   Navigator.pop(ctx);
-                  unawaited(_pickAndSendImage(ImageSource.camera));
+                  unawaited(_pickImage(ImageSource.camera));
                 },
               ),
             ],
@@ -377,6 +561,17 @@ class _PromptsTabState extends State<PromptsTab> {
                           label: const Text('新会话'),
                           onPressed: project == null ? null : _addSession,
                         ),
+                        if (project?.ide == 'codex') ...[
+                          const SizedBox(width: 6),
+                          ActionChip(
+                            avatar: const Icon(
+                              Icons.computer_outlined,
+                              size: 18,
+                            ),
+                            label: const Text('PC 会话'),
+                            onPressed: _openCodexDesktopSessions,
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -394,6 +589,11 @@ class _PromptsTabState extends State<PromptsTab> {
             ),
           ),
         ),
+        if (state.recentOtherProjectActivities.isNotEmpty)
+          _OtherProjectActivityStrip(
+            activities: state.recentOtherProjectActivities,
+            projects: state.visibleProjects,
+          ),
         Expanded(
           child: project == null
               ? Center(
@@ -411,41 +611,130 @@ class _PromptsTabState extends State<PromptsTab> {
                   ),
                 )
               : messages.isEmpty
-                  ? Center(
-                      child: Text(
-                        chat?.hasContext == true
-                            ? '本会话已有 $ideLabel 上下文，继续发指令即可'
-                            : '在本会话发送指令，同一 Session 会保持 $ideLabel 上下文',
-                      ),
-                    )
-                  : ListView.builder(
-                      controller: _scrollController,
-                      // reverse：打开会话时默认停在最新消息（底部）
-                      reverse: true,
-                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
-                      itemCount: messages.length,
-                      itemBuilder: (context, index) {
-                        final m = messages[messages.length - 1 - index];
-                        return _MessageBubble(
-                          key: ValueKey(m.id),
-                          message: m,
-                          statusHint: _statusHint(m),
-                        );
-                      },
-                    ),
+              ? Center(
+                  child: Text(
+                    chat?.cursorChatId != null
+                        ? '已关联 PC Codex Session，发送指令即可在原会话继续'
+                        : chat?.hasContext == true
+                        ? '本会话已有 $ideLabel 上下文，继续发指令即可'
+                        : '在本会话发送指令，同一 Session 会保持 $ideLabel 上下文',
+                  ),
+                )
+              : ListView.builder(
+                  controller: _scrollController,
+                  // reverse：打开会话时默认停在最新消息（底部）
+                  reverse: true,
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                  itemCount: messages.length,
+                  itemBuilder: (context, index) {
+                    final m = messages[messages.length - 1 - index];
+                    return _MessageBubble(
+                      key: ValueKey(m.id),
+                      message: m,
+                      statusHint: _statusHint(m),
+                    );
+                  },
+                ),
         ),
         _ComposerBar(
           controller: _controller,
           focusNode: _focusNode,
           enabled: project != null && !_sending,
-          canSend: project != null && !_sending && _hasText,
+          canSend:
+              project != null &&
+              !_sending &&
+              (_hasText || _pendingImageBytes != null),
           sending: _sending,
           hasProject: project != null,
           ideLabel: ideLabel,
+          pendingImageBytes: _pendingImageBytes,
+          pendingImageName: _pendingImageName,
           onSend: _send,
           onPickImage: _showImageSourceSheet,
+          onRemovePendingImage: () => setState(() {
+            _pendingImageBytes = null;
+            _pendingImageName = null;
+            _pendingImageMime = null;
+          }),
         ),
       ],
+    );
+  }
+}
+
+class _OtherProjectActivityStrip extends StatelessWidget {
+  const _OtherProjectActivityStrip({
+    required this.activities,
+    required this.projects,
+  });
+
+  final List<ProjectActivity> activities;
+  final List<Project> projects;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Card(
+        margin: EdgeInsets.zero,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.sync_alt, size: 18, color: scheme.primary),
+                  const SizedBox(width: 8),
+                  Text('其他项目动态', style: Theme.of(context).textTheme.labelLarge),
+                ],
+              ),
+              for (final activity in activities.take(3))
+                _activityTile(context, activity),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _activityTile(BuildContext context, ProjectActivity activity) {
+    final scheme = Theme.of(context).colorScheme;
+    final (label, icon, color) = switch (activity.status) {
+      'queued' => ('排队中', Icons.schedule, scheme.tertiary),
+      'delivered' => ('已接收', Icons.download_done, scheme.primary),
+      'running' => ('执行中', Icons.autorenew, scheme.primary),
+      'done' => ('已完成', Icons.check_circle_outline, Colors.green),
+      'failed' => ('执行失败', Icons.error_outline, scheme.error),
+      _ => (activity.status, Icons.info_outline, scheme.onSurfaceVariant),
+    };
+    var projectName = activity.projectId;
+    for (final project in projects) {
+      if (project.id == activity.projectId) {
+        projectName = project.displayName;
+        break;
+      }
+    }
+    final result = activity.result?.trim() ?? '';
+    final detail =
+        (activity.status == 'done' || activity.status == 'failed') &&
+            result.isNotEmpty
+        ? result
+        : activity.content;
+
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      visualDensity: VisualDensity.compact,
+      leading: Icon(icon, size: 18, color: color),
+      title: Text(
+        '$projectName · $label',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(detail, maxLines: 1, overflow: TextOverflow.ellipsis),
     );
   }
 }
@@ -459,8 +748,11 @@ class _ComposerBar extends StatefulWidget {
     required this.sending,
     required this.hasProject,
     required this.ideLabel,
+    required this.pendingImageBytes,
+    required this.pendingImageName,
     required this.onSend,
     required this.onPickImage,
+    required this.onRemovePendingImage,
   });
 
   final TextEditingController controller;
@@ -470,8 +762,11 @@ class _ComposerBar extends StatefulWidget {
   final bool sending;
   final bool hasProject;
   final String ideLabel;
+  final Uint8List? pendingImageBytes;
+  final String? pendingImageName;
   final VoidCallback onSend;
   final VoidCallback onPickImage;
+  final VoidCallback onRemovePendingImage;
 
   @override
   State<_ComposerBar> createState() => _ComposerBarState();
@@ -512,9 +807,7 @@ class _ComposerBarState extends State<_ComposerBar> {
     final text = words.trim();
     if (text.isEmpty) return;
     var prefix = widget.controller.text;
-    if (prefix.isNotEmpty &&
-        !prefix.endsWith(' ') &&
-        !prefix.endsWith('\n')) {
+    if (prefix.isNotEmpty && !prefix.endsWith(' ') && !prefix.endsWith('\n')) {
       prefix = '$prefix ';
     }
     final next = '$prefix$text';
@@ -634,112 +927,189 @@ class _ComposerBarState extends State<_ComposerBar> {
       color: scheme.surface,
       child: Padding(
         padding: EdgeInsets.fromLTRB(10, 10, 10, 10 + bottomInset),
-        child: Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              IconButton.filledTonal(
-                tooltip: '发送图片到 PC',
-                onPressed: enabled ? widget.onPickImage : null,
-                style: IconButton.styleFrom(
-                  fixedSize: const Size(44, 44),
-                  minimumSize: const Size(44, 44),
-                  maximumSize: const Size(44, 44),
-                  padding: EdgeInsets.zero,
-                  shape: const CircleBorder(),
-                ),
-                icon: const Icon(Icons.add_photo_alternate_outlined),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (widget.pendingImageBytes != null) ...[
+              _PendingImagePreview(
+                bytes: widget.pendingImageBytes!,
+                fileName: widget.pendingImageName ?? '图片',
+                onRemove: widget.onRemovePendingImage,
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Listener(
-                  behavior: HitTestBehavior.translucent,
-                  onPointerDown: enabled ? _onPointerDown : null,
-                  onPointerUp: _onPointerUpOrCancel,
-                  onPointerCancel: _onPointerUpOrCancel,
-                  child: TextField(
-                    controller: widget.controller,
-                    focusNode: widget.focusNode,
-                    minLines: 1,
-                    maxLines: 6,
-                    enabled: enabled,
-                    // 录音中只读，避免安卓10选区/输入法与语音冲突闪退
-                    readOnly: _listening,
-                    enableInteractiveSelection: !_listening,
-                    contextMenuBuilder: _listening
-                        ? (context, editableTextState) =>
-                            const SizedBox.shrink()
-                        : null,
-                    textInputAction: TextInputAction.newline,
-                    keyboardType: TextInputType.multiline,
-                    textCapitalization: TextCapitalization.sentences,
-                    style: Theme.of(context).textTheme.bodyLarge,
-                    decoration: InputDecoration(
-                      hintText: _hint,
-                      filled: true,
-                      fillColor: _listening
-                          ? scheme.primaryContainer.withValues(alpha: 0.55)
-                          : enabled
-                              ? scheme.surfaceContainerHighest.withValues(
-                                  alpha: 0.72,
-                                )
-                              : scheme.surfaceContainerHighest.withValues(
-                                  alpha: 0.35,
-                                ),
-                      prefixIcon: _listening
-                          ? Icon(Icons.mic, color: scheme.primary)
+              const SizedBox(height: 8),
+            ],
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                IconButton.filledTonal(
+                  tooltip: '添加图片',
+                  onPressed: enabled ? widget.onPickImage : null,
+                  style: IconButton.styleFrom(
+                    fixedSize: const Size(44, 44),
+                    minimumSize: const Size(44, 44),
+                    maximumSize: const Size(44, 44),
+                    padding: EdgeInsets.zero,
+                    shape: const CircleBorder(),
+                  ),
+                  icon: const Icon(Icons.add_photo_alternate_outlined),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Listener(
+                    behavior: HitTestBehavior.translucent,
+                    onPointerDown: enabled ? _onPointerDown : null,
+                    onPointerUp: _onPointerUpOrCancel,
+                    onPointerCancel: _onPointerUpOrCancel,
+                    child: TextField(
+                      controller: widget.controller,
+                      focusNode: widget.focusNode,
+                      minLines: 1,
+                      maxLines: 6,
+                      enabled: enabled,
+                      // 录音中只读，避免安卓10选区/输入法与语音冲突闪退
+                      readOnly: _listening,
+                      enableInteractiveSelection: !_listening,
+                      contextMenuBuilder: _listening
+                          ? (context, editableTextState) =>
+                                const SizedBox.shrink()
                           : null,
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 12,
-                      ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(22),
-                        borderSide: BorderSide.none,
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(22),
-                        borderSide: BorderSide.none,
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(22),
-                        borderSide: BorderSide(
-                          color: scheme.primary.withValues(alpha: 0.45),
-                          width: 1.5,
+                      textInputAction: TextInputAction.newline,
+                      keyboardType: TextInputType.multiline,
+                      textCapitalization: TextCapitalization.sentences,
+                      style: Theme.of(context).textTheme.bodyLarge,
+                      decoration: InputDecoration(
+                        hintText: _hint,
+                        filled: true,
+                        fillColor: _listening
+                            ? scheme.primaryContainer.withValues(alpha: 0.55)
+                            : enabled
+                            ? scheme.surfaceContainerHighest.withValues(
+                                alpha: 0.72,
+                              )
+                            : scheme.surfaceContainerHighest.withValues(
+                                alpha: 0.35,
+                              ),
+                        prefixIcon: _listening
+                            ? Icon(Icons.mic, color: scheme.primary)
+                            : null,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 12,
                         ),
-                      ),
-                      disabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(22),
-                        borderSide: BorderSide.none,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(22),
+                          borderSide: BorderSide.none,
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(22),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(22),
+                          borderSide: BorderSide(
+                            color: scheme.primary.withValues(alpha: 0.45),
+                            width: 1.5,
+                          ),
+                        ),
+                        disabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(22),
+                          borderSide: BorderSide.none,
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 6),
-              AnimatedOpacity(
-                opacity: widget.canSend || widget.sending ? 1 : 0.45,
-                duration: const Duration(milliseconds: 160),
-                child: IconButton.filled(
-                  tooltip: '发送',
-                  onPressed: widget.canSend ? widget.onSend : null,
-                  style: IconButton.styleFrom(
-                    minimumSize: const Size(48, 48),
+                const SizedBox(width: 6),
+                AnimatedOpacity(
+                  opacity: widget.canSend || widget.sending ? 1 : 0.45,
+                  duration: const Duration(milliseconds: 160),
+                  child: IconButton.filled(
+                    tooltip: '发送',
+                    onPressed: widget.canSend ? widget.onSend : null,
+                    style: IconButton.styleFrom(
+                      minimumSize: const Size(48, 48),
+                    ),
+                    icon: widget.sending
+                        ? SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2.2,
+                              color: scheme.onPrimary,
+                            ),
+                          )
+                        : const Icon(Icons.send_rounded),
                   ),
-                  icon: widget.sending
-                      ? SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2.2,
-                            color: scheme.onPrimary,
-                          ),
-                        )
-                      : const Icon(Icons.send_rounded),
                 ),
-              ),
-            ],
-          ),
+              ],
+            ),
+          ],
         ),
+      ),
+    );
+  }
+}
+
+class _PendingImagePreview extends StatelessWidget {
+  const _PendingImagePreview({
+    required this.bytes,
+    required this.fileName,
+    required this.onRemove,
+  });
+
+  final Uint8List bytes;
+  final String fileName;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(9),
+            child: Image.memory(
+              bytes,
+              width: 68,
+              height: 68,
+              fit: BoxFit.cover,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('已添加图片', style: Theme.of(context).textTheme.labelLarge),
+                const SizedBox(height: 2),
+                Text(
+                  fileName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                Text(
+                  '发送时与文字指令一起提交',
+                  style: Theme.of(context).textTheme.labelSmall,
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: '移除图片',
+            onPressed: onRemove,
+            icon: const Icon(Icons.close),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -780,8 +1150,7 @@ class _MessageBubbleState extends State<_MessageBubble>
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Align(
-            alignment:
-                fromPc ? Alignment.centerLeft : Alignment.centerRight,
+            alignment: fromPc ? Alignment.centerLeft : Alignment.centerRight,
             child: GestureDetector(
               onLongPress: fromPc
                   ? null
@@ -801,8 +1170,10 @@ class _MessageBubbleState extends State<_MessageBubble>
                 constraints: BoxConstraints(
                   maxWidth: MediaQuery.of(context).size.width * 0.82,
                 ),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: fromPc
                       ? scheme.secondaryContainer
@@ -818,6 +1189,12 @@ class _MessageBubbleState extends State<_MessageBubble>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(message.content),
+                    if (toAgent &&
+                        attachment != null &&
+                        attachment.isImage) ...[
+                      const SizedBox(height: 8),
+                      _SentImagePreview(attachment: attachment),
+                    ],
                     const SizedBox(height: 4),
                     Text(
                       statusHint,
@@ -825,7 +1202,7 @@ class _MessageBubbleState extends State<_MessageBubble>
                     ),
                     if (fromPc) ...[
                       const SizedBox(height: 8),
-                      _FileDownloadButton(attachment: attachment!),
+                      _FileDownloadButton(attachment: attachment),
                     ],
                     if (toAgent && attachment != null) ...[
                       const SizedBox(height: 8),
@@ -861,8 +1238,10 @@ class _MessageBubbleState extends State<_MessageBubble>
                 constraints: BoxConstraints(
                   maxWidth: MediaQuery.of(context).size.width * 0.88,
                 ),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: scheme.surfaceContainerHighest,
                   borderRadius: const BorderRadius.only(
@@ -877,6 +1256,121 @@ class _MessageBubbleState extends State<_MessageBubble>
           ],
         ],
       ),
+    );
+  }
+}
+
+class _SentImagePreview extends StatefulWidget {
+  const _SentImagePreview({required this.attachment});
+
+  final FileAttachment attachment;
+
+  @override
+  State<_SentImagePreview> createState() => _SentImagePreviewState();
+}
+
+class _SentImagePreviewState extends State<_SentImagePreview> {
+  late Future<List<int>> _bytesFuture;
+  String? _loadedFileId;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _loadIfNeeded();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SentImagePreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.attachment.id != widget.attachment.id) _loadIfNeeded();
+  }
+
+  void _loadIfNeeded() {
+    if (_loadedFileId == widget.attachment.id) return;
+    _loadedFileId = widget.attachment.id;
+    _bytesFuture = context.read<AppState>().downloadAttachmentBytes(
+      widget.attachment.id,
+    );
+  }
+
+  void _showFullImage(Uint8List bytes) {
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        final size = MediaQuery.of(context).size;
+        return Dialog(
+          child: SizedBox(
+            width: size.width * 0.9,
+            height: size.height * 0.75,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: InteractiveViewer(
+                    child: Image.memory(bytes, fit: BoxFit.contain),
+                  ),
+                ),
+                Positioned(
+                  top: 4,
+                  right: 4,
+                  child: IconButton.filledTonal(
+                    tooltip: '关闭',
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.close),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final previewWidth = (MediaQuery.of(context).size.width * 0.65)
+        .clamp(160.0, 260.0)
+        .toDouble();
+    return FutureBuilder<List<int>>(
+      future: _bytesFuture,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Container(
+            width: previewWidth,
+            height: 150,
+            alignment: Alignment.center,
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+            child: const Icon(Icons.broken_image_outlined, size: 36),
+          );
+        }
+        if (!snapshot.hasData) {
+          return SizedBox(
+            width: previewWidth,
+            height: 150,
+            child: const Center(
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          );
+        }
+
+        final bytes = Uint8List.fromList(snapshot.data!);
+        return GestureDetector(
+          onTap: () => _showFullImage(bytes),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.memory(
+              bytes,
+              width: previewWidth,
+              height: 180,
+              fit: BoxFit.cover,
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -914,9 +1408,9 @@ class _FileDownloadButton extends StatelessWidget {
     if (status.isGranted) return;
     final req = await Permission.requestInstallPackages.request();
     if (!req.isGranted && context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请允许「安装未知应用」后再打开 APK')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请允许「安装未知应用」后再打开 APK')));
       await openAppSettings();
     }
   }
@@ -924,9 +1418,9 @@ class _FileDownloadButton extends StatelessWidget {
   Future<void> _openSaved(BuildContext context, String path) async {
     if (!await File(path).exists()) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('文件不存在，请重新下载')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('文件不存在，请重新下载')));
       return;
     }
 
@@ -948,9 +1442,9 @@ class _FileDownloadButton extends StatelessWidget {
       );
     } catch (e) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('无法打开：${result.message}；$e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('无法打开：${result.message}；$e')));
     }
   }
 
@@ -967,9 +1461,9 @@ class _FileDownloadButton extends StatelessWidget {
   Future<void> _copyPath(BuildContext context, String path) async {
     await Clipboard.setData(ClipboardData(text: path));
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('路径已复制')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('路径已复制')));
   }
 
   Future<void> _download(BuildContext context) async {
@@ -1031,8 +1525,8 @@ class _FileDownloadButton extends StatelessWidget {
             busy
                 ? '下载中 ${attachment.fileName}…'
                 : (savedPath == null
-                    ? '下载 ${attachment.fileName}（$sizeLabel）'
-                    : '重新下载 ${attachment.fileName}'),
+                      ? '下载 ${attachment.fileName}（$sizeLabel）'
+                      : '重新下载 ${attachment.fileName}'),
           ),
         ),
         if (savedPath != null) ...[
@@ -1057,8 +1551,10 @@ class _FileDownloadButton extends StatelessWidget {
               onTap: () => _openSaved(context, savedPath),
               onLongPress: () => _copyPath(context, savedPath),
               child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1068,9 +1564,9 @@ class _FileDownloadButton extends StatelessWidget {
                       child: Text(
                         savedPath,
                         style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                              color: scheme.primary,
-                              decoration: TextDecoration.underline,
-                            ),
+                          color: scheme.primary,
+                          decoration: TextDecoration.underline,
+                        ),
                       ),
                     ),
                   ],

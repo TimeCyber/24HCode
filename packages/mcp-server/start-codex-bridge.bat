@@ -1,16 +1,21 @@
 @echo off
 setlocal
 set "PATH=C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\nvm4w\nodejs;D:\Git\cmd"
+if not defined HOME set "HOME=%USERPROFILE%"
+if not defined CODEX_HOME set "CODEX_HOME=%USERPROFILE%\.codex"
 cd /d D:\androidproject\CodeAssit\packages\mcp-server
 
 REM 默认本地中继；若已用 pair-claim 兑换，则优先加载云端 deviceToken
-set "CODEASSIST_SERVER_URL=http://127.0.0.1:8787"
-set "CODEASSIST_TOKEN=codeassist-dev-token"
+set "_CODEASSIST_EXPLICIT_RELAY="
+if defined CODEASSIST_SERVER_URL set "_CODEASSIST_EXPLICIT_RELAY=1"
+if defined CODEASSIST_TOKEN set "_CODEASSIST_EXPLICIT_RELAY=1"
+if not defined CODEASSIST_SERVER_URL set "CODEASSIST_SERVER_URL=http://127.0.0.1:8787"
+if not defined CODEASSIST_TOKEN set "CODEASSIST_TOKEN=codeassist-dev-token"
 set "CODEASSIST_IDE=codex"
 set "CODEASSIST_WORKSPACE=D:/androidproject/CodeAssit"
 set "CODEASSIST_MCP_BUILD=bridge-0.3.5"
 
-if exist "%~dp0.codeassist-device.env" (
+if not defined _CODEASSIST_EXPLICIT_RELAY if exist "%~dp0.codeassist-device.env" (
   echo [codeassist] loading .codeassist-device.env
   for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%~dp0.codeassist-device.env") do (
     if not "%%A"=="" if not "%%B"=="" set "%%A=%%B"
