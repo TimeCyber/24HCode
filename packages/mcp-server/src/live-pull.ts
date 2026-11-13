@@ -3,9 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 import type { PromptDelivery } from "@codeassist/shared";
 import type { ApiClient } from "./api-client.js";
+import { MobileConfirmations } from "./mobile-confirmation.js";
+import { runCodexAppServer, type ExecutionProgress } from "./codex-app-runner.js";
 import {
   openIdeWorkspace,
   startBridgeForWorkspace,
@@ -56,14 +59,33 @@ function processIsAlive(pid: number | undefined): boolean {
   }
 }
 
+function readLockOwner(contents: string): AgentSessionLockOwner | undefined {
+  try {
+    const owner = JSON.parse(contents) as Partial<AgentSessionLockOwner> | null;
+    if (owner && typeof owner.token === "string" && owner.token &&
+        typeof owner.host === "string" && owner.host &&
+        typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0 &&
+        typeof owner.heartbeatAt === "number" && owner.heartbeatAt > 0) {
+      return owner as AgentSessionLockOwner;
+    }
+  } catch {
+    /* An interrupted write can leave an incomplete lock file. */
+  }
+  return undefined;
+}
+
 /**
- * Serialize writes to a Cursor/Codex conversation across duplicate bridge/MCP
+ * Serialize a project's phone-command queue across duplicate bridge/MCP
  * processes. The in-memory drain guard only protects one process; a lock in the
  * OS temp directory is shared by all consumers on this machine.
  */
-async function acquireAgentSessionLock(
+export async function acquireAgentSessionLock(
   projectId: string,
   chatSessionId?: string,
+  { signal, waitMs = agentMaxTimeoutMs() + 60_000 }: {
+    signal?: AbortSignal;
+    waitMs?: number;
+  } = {},
 ): Promise<AgentSessionLock> {
   const key = `${projectId}:${chatSessionId || "default"}`;
   const name = createHash("sha256").update(key).digest("hex");
@@ -71,60 +93,65 @@ async function acquireAgentSessionLock(
   fs.mkdirSync(dir, { recursive: true });
   const lockPath = path.join(dir, `${name}.lock`);
   const token = randomUUID();
+  const tempPath = `${lockPath}.${token}.tmp`;
   const owner: AgentSessionLockOwner = {
     token,
     pid: process.pid,
     host: os.hostname(),
     heartbeatAt: Date.now(),
   };
+  const deadline = performance.now() + waitMs;
   const writeOwner = () => {
     try {
-      const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
-      if (current.token === token) {
+      const current = readLockOwner(fs.readFileSync(lockPath, "utf8"));
+      if (current?.token === token) {
         owner.heartbeatAt = Date.now();
-        fs.writeFileSync(lockPath, JSON.stringify(owner), "utf8");
+        // Keep the last valid owner visible if the process exits during a write.
+        fs.writeFileSync(tempPath, JSON.stringify(owner), "utf8");
+        fs.renameSync(tempPath, lockPath);
       }
     } catch {
-      /* the lock may be removed while this process is shutting down */
+      try { fs.rmSync(tempPath, { force: true }); } catch { /* retry next heartbeat */ }
     }
   };
 
   while (true) {
+    signal?.throwIfAborted();
     try {
       const fd = fs.openSync(lockPath, "wx");
-      fs.writeFileSync(fd, JSON.stringify(owner), "utf8");
-      fs.closeSync(fd);
+      try {
+        owner.heartbeatAt = Date.now();
+        fs.writeFileSync(fd, JSON.stringify(owner), "utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      let existing: AgentSessionLockOwner | undefined;
-      let stale = false;
       try {
-        existing = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
-        const ageMs = Date.now() - (existing.heartbeatAt || 0);
-        const sameHost = existing.host === os.hostname();
-        stale = sameHost
-          ? !processIsAlive(existing.pid) && !processIsAlive(existing.agentPid)
-          : ageMs > 2 * 60 * 60 * 1000;
-      } catch {
-        try {
-          stale = Date.now() - fs.statSync(lockPath).mtimeMs > 30_000;
-        } catch {
-          stale = true;
+        const snapshot = fs.readFileSync(lockPath, "utf8");
+        const existing = readLockOwner(snapshot);
+        const stale = !existing
+          ? Date.now() - fs.statSync(lockPath).mtimeMs >= 30_000
+          : existing.host === owner.host
+            ? !processIsAlive(existing.pid) && !processIsAlive(existing.agentPid)
+            : Date.now() - existing.heartbeatAt > 2 * 60 * 60 * 1000;
+        // Compare the bytes even when the previous owner's JSON is incomplete.
+        if (stale && fs.readFileSync(lockPath, "utf8") === snapshot) {
+          fs.unlinkSync(lockPath);
+          console.error(`[codeassist-mcp] recovered ${existing ? "abandoned" : "malformed"} session lock project=${projectId}`);
+        }
+      } catch (recoveryError) {
+        const code = (recoveryError as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "EBUSY" && code !== "EPERM") {
+          throw recoveryError;
         }
       }
-      if (stale) {
-        // Re-read the owner immediately before removing a stale lock so a
-        // heartbeat or a concurrent recovery cannot delete a new owner's lock.
-        try {
-          const latest = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
-          if (!existing || latest.token === existing.token) fs.unlinkSync(lockPath);
-        } catch {
-          /* another process already reclaimed it */
-        }
-        continue;
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) {
+        throw new Error("等待同一会话的执行锁超时，请检查 PC 上是否仍有任务在运行");
       }
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await delay(Math.min(500, remaining), undefined, { signal });
     }
   }
 
@@ -138,8 +165,8 @@ async function acquireAgentSessionLock(
     release() {
       clearInterval(heartbeatTimer);
       try {
-        const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as AgentSessionLockOwner;
-        if (current.token === token) fs.unlinkSync(lockPath);
+        const current = readLockOwner(fs.readFileSync(lockPath, "utf8"));
+        if (current?.token === token) fs.unlinkSync(lockPath);
       } catch {
         /* already released or reclaimed */
       }
@@ -205,6 +232,9 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
   let draining = false;
   let wakeAgain = false;
   const seen = new Set<string>();
+  const lockWait = new AbortController();
+  let activeConfirmations: MobileConfirmations | undefined;
+  let activeRun: AbortController | undefined;
 
   const connect = () => {
     if (closed) return;
@@ -259,6 +289,10 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
           claimedBy?: string;
         };
       };
+      if (msg.type === "task.updated" && msg.payload) {
+        activeConfirmations?.observe(msg.payload as import("@codeassist/shared").TaskEvent);
+        return;
+      }
       if (msg.type === "project.open" && msg.payload) {
         const st = msg.payload.status;
         if (!st || st === "queued") {
@@ -269,7 +303,15 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
       if (msg.type !== "prompt.updated" || !msg.payload) return;
       const projectId = opts.getProjectId();
       if (!projectId || msg.payload.projectId !== projectId) return;
-      if (msg.payload.status && msg.payload.status !== "queued") return;
+      const status = msg.payload.status;
+      if (
+        status &&
+        status !== "queued" &&
+        status !== "done" &&
+        status !== "failed"
+      ) {
+        return;
+      }
 
       // 执行中又来新指令：不要写入 seen（否则完成后永远不会再跑），只唤醒排空
       if (draining) {
@@ -337,15 +379,27 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
         const projectId = opts.getProjectId();
         if (!projectId) break;
 
-        // 一次一条，前一条完成后再拉下一条
-        const prompts = await api.pullPrompts(projectId);
-        if (prompts.length === 0) continue;
-
-        for (const p of prompts) seen.add(p.id);
-        opts.onPrompts(prompts);
-        const chatSessionId = prompts.find((p) => p.chatSessionId)?.chatSessionId;
-        const sessionLock = await acquireAgentSessionLock(projectId, chatSessionId);
+        // 先锁住项目队列再认领，避免另一个 bridge 把下一条提前标为 delivered。
+        let queueLock: AgentSessionLock;
         try {
+          queueLock = await acquireAgentSessionLock(projectId, "__prompt_queue__", {
+            signal: lockWait.signal,
+          });
+        } catch (err) {
+          if (!closed) {
+            console.error(
+              `[codeassist-mcp] cannot acquire project queue lock: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          break;
+        }
+        try {
+            // 一次只认领一条；项目锁覆盖 pull 到 complete 的整个过程。
+            const prompts = await api.pullPrompts(projectId);
+            if (prompts.length === 0) continue;
+            for (const p of prompts) seen.add(p.id);
+            const chatSessionId = prompts.find((p) => p.chatSessionId)?.chatSessionId;
+            opts.onPrompts(prompts);
             console.error(
               `[codeassist-mcp] 串行执行手机指令 (${prompts.length}) → 完成后自动接下一条`,
             );
@@ -401,14 +455,50 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
             const maxMs = agentMaxTimeoutMs();
             let agentResult: AgentRunResult;
             let hardTimer: ReturnType<typeof setTimeout> | undefined;
+            activeRun = new AbortController();
+            activeConfirmations = new MobileConfirmations(api, projectId);
+            let progressChain: Promise<void> | undefined;
+            let managedCodex = false;
+            let pendingProgress: ExecutionProgress | undefined;
+            const flushProgress = () => {
+              if (progressChain || !pendingProgress) return progressChain ?? Promise.resolve();
+              progressChain = (async () => {
+                // Coalesce snapshots while a slow relay request is in flight.
+                // A long task must not leave minutes of stale updates queued.
+                while (pendingProgress) {
+                  const progress = pendingProgress;
+                  pendingProgress = undefined;
+                  await api.syncSessionContext({
+                    projectId, chatSessionId,
+                    summary: `Codex 正在执行：${prompts.map((p) => p.content).join(" | ").slice(0, 180)}`,
+                    ...progress,
+                    openFiles: progress.openFiles ?? [],
+                  }).catch(() => undefined);
+                }
+              })().finally(() => { progressChain = undefined; });
+              return progressChain;
+            };
+            const progressTimer = setInterval(() => void flushProgress(), 750);
+            const codexControl = {
+              confirmations: activeConfirmations,
+              signal: activeRun.signal,
+              chatSessionId,
+              onProgress(progress: ExecutionProgress) {
+                managedCodex = true;
+                pendingProgress = progress;
+                if (progress.status === "waiting_user" || progress.status === "blocked") void flushProgress();
+              },
+            };
             let lastHeartbeatAt = 0;
+            let heartbeatInFlight: Promise<void> | undefined;
             const heartbeat = () => {
               const now = Date.now();
-              if (now - lastHeartbeatAt < 60_000) return;
+              if (heartbeatInFlight || now - lastHeartbeatAt < 60_000) return;
               lastHeartbeatAt = now;
-              for (const p of prompts) {
-                void api.ackPrompt(p.id).catch(() => undefined);
-              }
+              heartbeatInFlight = Promise.all(prompts.map((p) =>
+                api.ackPrompt(p.id).catch(() => undefined),
+              )).then(() => undefined).finally(() => { heartbeatInFlight = undefined; });
+              if (ide === "codex" || managedCodex) return;
               void api
                 .syncSessionContext({
                   projectId,
@@ -420,6 +510,7 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                 })
                 .catch(() => undefined);
             };
+            const leaseTimer = setInterval(heartbeat, 30_000);
             try {
               const raceAgent = (
                 run: () => Promise<AgentRunResult>,
@@ -431,6 +522,7 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                   }),
                   new Promise<AgentRunResult>((resolve) => {
                     hardTimer = setTimeout(() => {
+                      activeRun?.abort();
                       resolve({
                         text: `[agent-error] 执行超过绝对上限(${Math.round(maxMs / 1000)}s)，已中止以免阻塞后续手机指令`,
                       });
@@ -450,7 +542,8 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                         idleMs,
                         maxMs,
                         heartbeat,
-                        (pid) => sessionLock.setAgentPid(pid),
+                        (pid) => queueLock.setAgentPid(pid),
+                        codexControl,
                       )
                   : () =>
                       runCursorAgent(
@@ -461,7 +554,7 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                         idleMs,
                         maxMs,
                         heartbeat,
-                        (pid) => sessionLock.setAgentPid(pid),
+                        (pid) => queueLock.setAgentPid(pid),
                       );
 
               agentResult = await raceAgent(runPrimary(resumeChatId));
@@ -503,7 +596,8 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                     idleMs,
                     maxMs,
                     heartbeat,
-                    (pid) => sessionLock.setAgentPid(pid),
+                    (pid) => queueLock.setAgentPid(pid),
+                    codexControl,
                   ),
                 );
               }
@@ -513,6 +607,12 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                 text: `[agent-error] ${err instanceof Error ? err.message : String(err)}`,
               };
             }
+            clearInterval(progressTimer);
+            clearInterval(leaseTimer);
+            await heartbeatInFlight;
+            await flushProgress();
+            activeRun = undefined;
+            activeConfirmations = undefined;
 
             if (chatSessionId && agentResult.cursorChatId) {
               await api
@@ -530,6 +630,7 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
             const ok = !resultText.startsWith("[agent-error]");
             const summary = truncate(resultText, 3500);
 
+            let resultSyncFailed = false;
             for (const p of prompts) {
               try {
                 await api.completePrompt(
@@ -538,6 +639,7 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                   summary || (ok ? "执行完成" : "执行失败"),
                 );
               } catch (err) {
+                resultSyncFailed = true;
                 console.error("[codeassist-mcp] complete_prompt failed:", err);
               }
             }
@@ -549,9 +651,10 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
                 summary: ok
                   ? `手机指令已完成：${prompts.map((p) => p.content).join(" | ").slice(0, 120)}`
                   : `手机指令失败：${prompts.map((p) => p.content).join(" | ").slice(0, 120)}`,
-                currentStep: ok ? "已回传结果到手机" : "执行失败，已回传错误",
+                currentStep: resultSyncFailed ? "执行已结束，指令结果同步失败"
+                  : ok ? "已回传结果到手机" : "执行失败，已回传错误",
                 openFiles: [],
-                status: ok ? "done" : "blocked",
+                status: ok && !resultSyncFailed ? "done" : "blocked",
                 extra: summary,
               })
               .catch(() => undefined);
@@ -559,20 +662,20 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
             await api
               .createTask({
                 projectId,
-                type: ok ? "completed" : "blocked",
-                title: ok ? "手机指令执行完成" : "手机指令执行失败",
+                type: ok && !resultSyncFailed ? "completed" : "blocked",
+                title: resultSyncFailed ? "手机指令结果同步失败" : ok ? "手机指令执行完成" : "手机指令执行失败",
                 detail: `指令：\n${prompts.map((p) => p.content).join("\n")}\n\n结果：\n${summary}`,
                 requireDecision: false,
               })
               .catch(() => undefined);
 
             notifyToast(
-              ok
+              resultSyncFailed ? "CodeAssist：执行已结束，结果同步失败" : ok
                 ? "CodeAssist：结果已同步到手机"
                 : "CodeAssist：执行失败，错误已同步到手机",
             );
         } finally {
-          sessionLock.release();
+          queueLock.release();
         }
         // 继续 while：再 pull 下一条 queued
         wakeAgain = true;
@@ -605,6 +708,8 @@ export function startLivePull(api: ApiClient, opts: Options): () => void {
 
   return () => {
     closed = true;
+    lockWait.abort();
+    activeRun?.abort();
     clearInterval(pollTimer);
     if (retryTimer) clearTimeout(retryTimer);
     ws?.close();
@@ -971,6 +1076,8 @@ function runCursorAgent(
 function findCodexCmd(): string | null {
   const override = process.env.CODEASSIST_CODEX_CMD?.trim();
   if (override && fs.existsSync(override)) return override;
+  const runtime = process.env.CODEX_APP_RUNTIME_CLI_PATH?.trim();
+  if (runtime && fs.existsSync(runtime)) return runtime;
   const local = process.env.LOCALAPPDATA ?? "";
   const binRoot = path.join(local, "OpenAI", "Codex", "bin");
   if (fs.existsSync(binRoot)) {
@@ -979,8 +1086,12 @@ function findCodexCmd(): string | null {
         .readdirSync(binRoot, { withFileTypes: true })
         .filter((d) => d.isDirectory())
         .map((d) => d.name)
-        .sort()
-        .reverse();
+        .sort((a, b) => {
+          const modified = (name: string) => {
+            try { return fs.statSync(path.join(binRoot, name, "codex.exe")).mtimeMs; } catch { return 0; }
+          };
+          return modified(b) - modified(a);
+        });
       for (const name of dirs) {
         const exe = path.join(binRoot, name, "codex.exe");
         if (fs.existsSync(exe)) return exe;
@@ -1001,245 +1112,34 @@ function findCodexCmd(): string | null {
   return null;
 }
 
-function extractCodexLastMessage(raw: string, outFile?: string): string {
-  if (outFile) {
-    try {
-      if (fs.existsSync(outFile)) {
-        const t = fs.readFileSync(outFile, "utf8").trim();
-        if (t) return t;
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  // --json 输出 JSONL：取最后一条带 message/text/content 的
-  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const obj = JSON.parse(lines[i]!) as Record<string, unknown>;
-      for (const key of ["last_agent_message", "message", "text", "content", "result"]) {
-        const v = obj[key];
-        if (typeof v === "string" && v.trim()) return v.trim();
-      }
-      const item = obj.item as Record<string, unknown> | undefined;
-      if (item && typeof item.text === "string" && item.text.trim()) {
-        return item.text.trim();
-      }
-    } catch {
-      /* continue */
-    }
-  }
-  return extractResultText(raw);
-}
-
 function runCodexAgent(
   workspace: string,
   contents: string[],
   deliveryIds: string[],
-  resumeChatId?: string,
-  idleTimeoutMs: number = agentIdleTimeoutMs(),
-  maxTimeoutMs: number = agentMaxTimeoutMs(),
-  onActivity?: () => void,
-  onSpawn?: (pid: number | undefined) => void,
+  resumeChatId: string | undefined,
+  idleTimeoutMs: number,
+  maxTimeoutMs: number,
+  onActivity: (() => void) | undefined,
+  onSpawn: ((pid: number | undefined) => void) | undefined,
+  control: {
+    confirmations: MobileConfirmations;
+    signal: AbortSignal;
+    chatSessionId?: string;
+    onProgress: (progress: ExecutionProgress) => void;
+  },
 ): Promise<AgentRunResult> {
-  return new Promise((resolve) => {
-    const codex = findCodexCmd();
-    if (!codex) {
-      resolve({
-        text: "[agent-error] 未找到 Codex CLI。请确认已安装 OpenAI Codex 桌面版，或设置 CODEASSIST_CODEX_CMD。",
-      });
-      return;
-    }
-
-    const prompt =
-      `你正在 Codex 中执行【手机客户端发来的指令】，必须像本地用户在 IDE 发 Prompt 一样认真改代码、跑命令。\n` +
-      `要求：\n` +
-      `1. 直接执行下列指令（不要只口头说明）\n` +
-      `2. 过程中可用 MCP codeassist：ack_prompt / sync_session_context\n` +
-      `3. 结束后用中文写清：做了什么、改了哪些文件、结果如何（这段会同步给手机）\n\n` +
-      contents.map((c, i) => `### 指令 ${i + 1}\n${c}`).join("\n\n") +
-      (deliveryIds.length ? `\n\nDeliveryIds: ${deliveryIds.join(", ")}` : "");
-
-    let promptArg = prompt;
-    let promptFile: string | null = null;
-    if (Buffer.byteLength(prompt, "utf8") > 6000) {
-      promptFile = path.join(
-        workspace,
-        `.codeassist-prompt-${Date.now()}.txt`,
-      );
-      try {
-        fs.writeFileSync(promptFile, prompt, "utf8");
-        promptArg = `请读取并严格执行文件中的指令：${promptFile}`;
-      } catch {
-        promptFile = null;
-      }
-    }
-
-    const outFile = path.join(
-      workspace,
-      `.codeassist`,
-      `codex-last-${Date.now()}.txt`,
-    );
-    try {
-      fs.mkdirSync(path.dirname(outFile), { recursive: true });
-    } catch {
-      /* ignore */
-    }
-
-    // ChatGPT 登录账号不支持部分默认新模型（如 gpt-6.1-sol），显式指定可用模型。
-    // 可用 CODEASSIST_CODEX_MODEL 覆盖，例如 gpt-5.6-luna / gpt-6-luna。
-    const model =
-      process.env.CODEASSIST_CODEX_MODEL?.trim() || "gpt-6-luna";
-
-    // Mobile prompts run headlessly, so there is no terminal UI to answer
-    // Codex's on-request approval prompts. Route eligible requests through
-    // Codex automatic review; this uses the workspace-write sandbox and can
-    // still deny risky actions. Keep the flag before `resume` so it applies
-    // to both new and resumed sessions.
-    const args = ["exec", "--approve-for-me", "-C", workspace];
-    if (resumeChatId) {
-      args.push("resume", resumeChatId);
-      console.error(`[codeassist-mcp] 续跑 Codex session: ${resumeChatId}`);
-    }
-    args.push(
-      "-m",
-      model,
-      "--json",
-      "-o",
-      outFile,
-      "--skip-git-repo-check",
-      promptArg,
-    );
-
-    console.error(
-      `[codeassist-mcp] Codex 执行中(model=${model}, idle=${Math.round(idleTimeoutMs / 1000)}s, max=${Math.round(maxTimeoutMs / 1000)}s): ${codex}`,
-    );
-
-    let out = "";
-    let err = "";
-    let settled = false;
-    let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    let maxTimer: ReturnType<typeof setTimeout> | undefined;
-    let killWaitTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const clearTimers = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (maxTimer) clearTimeout(maxTimer);
-      if (killWaitTimer) clearTimeout(killWaitTimer);
-    };
-
-    const finish = (text: string, cursorChatId?: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimers();
-      for (const f of [promptFile, outFile]) {
-        if (!f) continue;
-        try {
-          fs.unlinkSync(f);
-        } catch {
-          /* ignore */
-        }
-      }
-      resolve({ text, cursorChatId });
-    };
-
-    // Resume must use the same Codex home as the desktop app that owns the thread.
-    const userProfile = process.env.USERPROFILE?.trim() || os.homedir();
-    const homeRoot = path.parse(userProfile).root;
-    const codexHome =
-      process.env.CODEX_HOME?.trim() || path.join(userProfile, ".codex");
-
-    const child = spawn(codex, args, {
-      cwd: workspace,
-      shell: false,
-      windowsHide: true,
-      env: {
-        ...process.env,
-        HOME: userProfile,
-        CODEX_HOME: codexHome,
-        ...(process.platform === "win32"
-          ? {
-              USERPROFILE: userProfile,
-              HOMEDRIVE:
-                process.env.HOMEDRIVE || homeRoot.replace(/[\\/]+$/, ""),
-              HOMEPATH:
-                process.env.HOMEPATH ||
-                userProfile.slice(homeRoot.length) ||
-                path.sep,
-            }
-          : {}),
-        CI: process.env.CI || "1",
-        NO_COLOR: "1",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    onSpawn?.(child.pid);
-
-    const abortForTimeout = (reason: string) => {
-      if (settled) return;
-      console.error(`[codeassist-mcp] Codex ${reason}，taskkill 进程树`);
-      killProcessTree(child);
-      killWaitTimer = setTimeout(() => {
-        if (settled) return;
-        killProcessTree(child);
-        const partial = [out, err].filter(Boolean).join("\n").trim();
-        finish(
-          `[agent-error] ${reason}，已中止以免阻塞后续手机指令\n${
-            extractCodexLastMessage(partial, outFile) || "(无输出)"
-          }`,
-          extractCursorChatId(partial) ?? resumeChatId,
-        );
-      }, 8_000);
-    };
-
-    const armIdleTimer = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        abortForTimeout(
-          `空闲超时(${Math.round(idleTimeoutMs / 1000)}s无输出)`,
-        );
-      }, idleTimeoutMs);
-    };
-    armIdleTimer();
-    maxTimer = setTimeout(() => {
-      abortForTimeout(`绝对上限(${Math.round(maxTimeoutMs / 1000)}s)`);
-    }, maxTimeoutMs);
-
-    const noteActivity = () => {
-      if (settled) return;
-      armIdleTimer();
-      try {
-        onActivity?.();
-      } catch {
-        /* ignore */
-      }
-    };
-
-    child.stdout?.on("data", (d: Buffer) => {
-      out += d.toString("utf8");
-      noteActivity();
-    });
-    child.stderr?.on("data", (d: Buffer) => {
-      err += d.toString("utf8");
-      noteActivity();
-    });
-    child.on("error", (e) => {
-      finish(`[agent-error] ${e.message}`);
-    });
-    child.on("close", (code) => {
-      const raw = [out, err].filter(Boolean).join("\n").trim();
-      const sessionId = extractCursorChatId(raw) ?? resumeChatId;
-      const text = extractCodexLastMessage(raw, outFile);
-      if (code !== 0 && !text) {
-        finish(`[agent-error] codex exited ${code}`, sessionId);
-        return;
-      }
-      if (code !== 0) {
-        finish(`[agent-error] exit=${code}\n${text}`, sessionId);
-        return;
-      }
-      finish(text || "Codex 已执行完成（无文本输出）", sessionId);
-    });
+  const codex = findCodexCmd();
+  if (!codex) return Promise.resolve({ text: "[agent-error] 未找到 Codex CLI，请设置 CODEASSIST_CODEX_CMD" });
+  const prompt = [
+    "你正在执行手机客户端发来的指令，请直接改代码、运行必要检查，并用中文说明最终结果。",
+    "桥接会自动同步执行进度和确认请求，不要重复 complete_prompt 或 report_task；不要拉取其他手机待办。",
+    ...contents.map((content, i) => "### 指令 " + (i + 1) + "\n" + content),
+    "DeliveryIds: " + deliveryIds.join(", "),
+  ].join("\n\n");
+  return runCodexAppServer({
+    codex, workspace, prompt, resumeChatId, idleTimeoutMs, maxTimeoutMs,
+    model: process.env.CODEASSIST_CODEX_MODEL?.trim() || undefined,
+    ...control, onActivity, onSpawn, kill: killProcessTree,
   });
 }
 

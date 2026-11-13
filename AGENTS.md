@@ -13,6 +13,8 @@
 4. 需要人工确认时 `report_task` + `requireDecision=true`，再拉 `get_pending_decisions`。
 5. 不要跳过远程审批结果；`approve` 才继续，`reject` 则停止并说明原因。
 6. 需要把电脑文件发到手机时，调用 MCP `send_file_to_client`。
+7. 需要用户作功能选择或确认操作意图时，使用 `request_client_decision` 等待手机答复；只有 `approved=true` 才继续，拒绝、超时或取消都停止该操作。CodeAssist 托管的 Codex App Server 任务会把原生命令、文件变更、临时权限及 MCP App 工具确认转发到手机客户端，并将手机答复写回原请求。`request_client_decision` 本身不授予沙箱权限，也不能代答本地 IDE/Codex 宿主在 MCP 工具执行前弹出的审批。
+8. `CODEASSIST_AGENT_CHILD=1` 表示当前任务由桥接托管，桥接负责拉取、确认接收和最终回传；不要再次拉取其他手机任务。执行状态、原生命令/文件审批和问题由 App Server 通道自动同步。
 
 手机发指令时，MCP live-pull 也会自动拉起 `codex exec`；规则里仍要求每轮主动 `get_pending_prompts`。
 

@@ -9,11 +9,15 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
 import '../app_state.dart';
+import '../client_update_policy.dart';
 import '../crash_log_service.dart';
 import '../ide_labels.dart';
 import '../models.dart';
 import '../safe_speech.dart';
 import '../widgets/linkified_text.dart';
+import '../widgets/chat_activity_bubble.dart';
+import '../widgets/remote_task_card.dart';
+import '../remote_request.dart';
 
 class PromptsTab extends StatefulWidget {
   const PromptsTab({super.key});
@@ -29,6 +33,7 @@ class _PromptsTabState extends State<PromptsTab> {
   bool _sending = false;
   bool _hasText = false;
   bool _projectPickerOpen = false;
+  Timer? _confirmationExpiryTimer;
   Uint8List? _pendingImageBytes;
   String? _pendingImageName;
   String? _pendingImageMime;
@@ -62,6 +67,7 @@ class _PromptsTabState extends State<PromptsTab> {
 
   @override
   void dispose() {
+    _confirmationExpiryTimer?.cancel();
     _controller.removeListener(_onInputChanged);
     _controller.dispose();
     _scrollController.dispose();
@@ -108,11 +114,9 @@ class _PromptsTabState extends State<PromptsTab> {
   }
 
   Future<void> _openProjectPicker() async {
-    // 与标题栏「目录」一致：先弹层再后台刷新，避免 refreshAll 卡住导致连点堆多个 sheet
+    // 本地快照即时展示；需要更新项目清单时可使用手动刷新。
     if (_projectPickerOpen) return;
     _projectPickerOpen = true;
-    final state = context.read<AppState>();
-    unawaited(state.refreshAll());
     try {
       if (!mounted) return;
       await showModalBottomSheet<void>(
@@ -278,118 +282,6 @@ class _PromptsTabState extends State<PromptsTab> {
     }
   }
 
-  Future<void> _openCodexDesktopSessions() async {
-    final state = context.read<AppState>();
-    final messenger = ScaffoldMessenger.of(context);
-    final sessionsFuture = state.fetchCodexDesktopSessions();
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (sheetContext) => SafeArea(
-        child: SizedBox(
-          height: MediaQuery.of(sheetContext).size.height * 0.72,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-                child: Text(
-                  '继续 PC Codex 会话',
-                  style: Theme.of(sheetContext).textTheme.titleMedium,
-                ),
-              ),
-              Expanded(
-                child: FutureBuilder<List<CodexDesktopSession>>(
-                  future: sessionsFuture,
-                  builder: (context, snapshot) {
-                    if (snapshot.hasError) {
-                      return Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Text('读取 PC 会话失败：${snapshot.error}'),
-                        ),
-                      );
-                    }
-                    if (!snapshot.hasData) {
-                      return const Center(child: CircularProgressIndicator());
-                    }
-                    final pcSessions = snapshot.data!;
-                    if (pcSessions.isEmpty) {
-                      return const Center(
-                        child: Padding(
-                          padding: EdgeInsets.all(24),
-                          child: Text(
-                            '暂无可续聊的 PC 会话。请确认 PC 端 Codex 与 CodeAssist bridge 在线，再重新打开此列表。',
-                            textAlign: TextAlign.center,
-                          ),
-                        ),
-                      );
-                    }
-                    return ListView.separated(
-                      itemCount: pcSessions.length,
-                      separatorBuilder: (context, index) =>
-                          const Divider(height: 1),
-                      itemBuilder: (_, index) {
-                        final session = pcSessions[index];
-                        final updated = session.updatedAt > 0
-                            ? DateTime.fromMillisecondsSinceEpoch(
-                                session.updatedAt * 1000,
-                              ).toLocal()
-                            : null;
-                        final updatedLabel = updated == null
-                            ? ''
-                            : '${updated.year}-${updated.month.toString().padLeft(2, '0')}-${updated.day.toString().padLeft(2, '0')} ${updated.hour.toString().padLeft(2, '0')}:${updated.minute.toString().padLeft(2, '0')}';
-                        final preview = session.preview?.trim();
-                        final sourceLabel = switch (session.source) {
-                          'vscode' => 'Codex 桌面',
-                          'appServer' => 'Codex App Server',
-                          'cli' => 'Codex CLI',
-                          'exec' => 'Codex exec',
-                          _ => 'PC Codex',
-                        };
-                        return ListTile(
-                          leading: const Icon(Icons.computer_outlined),
-                          title: Text(
-                            session.title,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          subtitle: Text(
-                            [
-                              if (preview != null && preview.isNotEmpty)
-                                preview,
-                              '$sourceLabel · $updatedLabel',
-                            ].join('\n'),
-                            maxLines: 3,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          onTap: () async {
-                            try {
-                              await state.continueCodexDesktopSession(session);
-                              if (sheetContext.mounted) {
-                                Navigator.pop(sheetContext);
-                              }
-                            } catch (e) {
-                              if (mounted) {
-                                messenger.showSnackBar(
-                                  SnackBar(content: Text(e.toString())),
-                                );
-                              }
-                            }
-                          },
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   Future<void> _confirmDeleteSession(ChatSession session) async {
     final ok = await showDialog<bool>(
       context: context,
@@ -494,18 +386,13 @@ class _PromptsTabState extends State<PromptsTab> {
 
   String _statusHint(PromptJob m) {
     if (m.attachment != null && !m.attachment!.isToAgent) return '文件';
-    final hasResult = m.result != null && m.result!.trim().isNotEmpty;
-    if (hasResult && (m.status == 'done' || m.status == 'failed')) {
-      return m.status == 'failed' ? '失败' : '完成';
-    }
-    if (hasResult &&
-        (m.status == 'running' ||
-            m.status == 'delivered' ||
-            m.status == 'queued')) {
-      // 结果已回传但状态偶发未刷新
-      return '完成';
-    }
-    switch (m.status) {
+    final status = displayPromptStatus(
+      m.status,
+      m.result,
+      m.updatedAt,
+      DateTime.now(),
+    );
+    switch (status) {
       case 'queued':
         return '排队等待…';
       case 'delivered':
@@ -516,8 +403,10 @@ class _PromptsTabState extends State<PromptsTab> {
         return '完成';
       case 'failed':
         return '失败';
+      case 'stale':
+        return '状态未更新';
       default:
-        return m.status;
+        return status;
     }
   }
 
@@ -529,6 +418,96 @@ class _PromptsTabState extends State<PromptsTab> {
     final sessions = state.chatSessions;
     final messages = state.chatMessages;
     final chat = state.activeChatSession;
+    final sessionsById = {for (final session in sessions) session.id: session};
+    final sessionsByThread = {
+      for (final session in sessions.reversed)
+        if (session.cursorChatId != null) session.cursorChatId!: session,
+    };
+    final awaitingConfirmation = <String>{};
+    final now = DateTime.now();
+    DateTime? nextConfirmationExpiry;
+
+    final rows = <({String key, int time, int order, Widget child})>[];
+    int time(String value) =>
+        DateTime.tryParse(value)?.millisecondsSinceEpoch ?? 0;
+    for (final message in messages) {
+      rows.add((
+        key: 'prompt:${message.id}',
+        time: time(message.createdAt),
+        order: 0,
+        child: _MessageBubble(
+          message: message,
+          statusHint: _statusHint(message),
+          showResult: false,
+        ),
+      ));
+      if (message.result?.trim().isNotEmpty == true &&
+          message.attachment?.direction != 'to_client') {
+        rows.add((
+          key: 'result:${message.id}',
+          time: time(message.updatedAt),
+          order: 3,
+          child: _MessageBubble(
+            message: message,
+            statusHint: _statusHint(message),
+            showRequest: false,
+          ),
+        ));
+      }
+    }
+    for (final activity in state.chatActivityLog.forConversation(
+      project?.id ?? '',
+      chat?.id,
+    )) {
+      rows.add((
+        key: 'activity:${activity.id}',
+        time: time(activity.timestamp),
+        order: 1,
+        child: ChatActivityBubble(activity: activity),
+      ));
+    }
+    for (final task in state.tasks) {
+      if (task.projectId != project?.id) continue;
+      final request = RemoteRequest.parse(task.detail);
+      if (request == null && !task.requireDecision) continue;
+      final expiresAt = request?.expiresAt;
+      final pending =
+          task.status == 'awaiting_decision' &&
+          (expiresAt == null || now.isBefore(expiresAt));
+      final owner =
+          sessionsById[request?.chatSessionId] ??
+          sessionsByThread[request?.threadId];
+      final targetChatId =
+          owner?.id ?? (pending ? chat?.id : request?.chatSessionId);
+      if (pending && targetChatId != null) {
+        awaitingConfirmation.add(targetChatId);
+        if (expiresAt != null &&
+            (nextConfirmationExpiry == null ||
+                expiresAt.isBefore(nextConfirmationExpiry))) {
+          nextConfirmationExpiry = expiresAt;
+        }
+      }
+      if (targetChatId != null && targetChatId != chat?.id) continue;
+      rows.add((
+        key: 'confirmation:${task.id}',
+        time: time(task.createdAt),
+        order: 2,
+        child: RemoteTaskCard(task: task),
+      ));
+    }
+    _confirmationExpiryTimer?.cancel();
+    if (nextConfirmationExpiry != null) {
+      _confirmationExpiryTimer = Timer(
+        nextConfirmationExpiry.difference(now),
+        () => setState(() {}),
+      );
+    }
+    rows.sort((a, b) {
+      final byTime = a.time.compareTo(b.time);
+      if (byTime != 0) return byTime;
+      final byOrder = a.order.compareTo(b.order);
+      return byOrder != 0 ? byOrder : a.key.compareTo(b.key);
+    });
 
     return Column(
       children: [
@@ -549,7 +528,11 @@ class _PromptsTabState extends State<PromptsTab> {
                             child: GestureDetector(
                               onLongPress: () => _confirmDeleteSession(s),
                               child: ChoiceChip(
-                                label: Text(s.title),
+                                label: Text(
+                                  awaitingConfirmation.contains(s.id)
+                                      ? '待确认（${s.title}）'
+                                      : s.title,
+                                ),
                                 selected: state.activeChatSessionId == s.id,
                                 onSelected: (_) =>
                                     state.selectChatSession(s.id),
@@ -561,17 +544,6 @@ class _PromptsTabState extends State<PromptsTab> {
                           label: const Text('新会话'),
                           onPressed: project == null ? null : _addSession,
                         ),
-                        if (project?.ide == 'codex') ...[
-                          const SizedBox(width: 6),
-                          ActionChip(
-                            avatar: const Icon(
-                              Icons.computer_outlined,
-                              size: 18,
-                            ),
-                            label: const Text('PC 会话'),
-                            onPressed: _openCodexDesktopSessions,
-                          ),
-                        ],
                       ],
                     ),
                   ),
@@ -589,11 +561,6 @@ class _PromptsTabState extends State<PromptsTab> {
             ),
           ),
         ),
-        if (state.recentOtherProjectActivities.isNotEmpty)
-          _OtherProjectActivityStrip(
-            activities: state.recentOtherProjectActivities,
-            projects: state.visibleProjects,
-          ),
         Expanded(
           child: state.needsDevicePairing
               ? Center(
@@ -621,7 +588,7 @@ class _PromptsTabState extends State<PromptsTab> {
                     ],
                   ),
                 )
-              : messages.isEmpty
+              : rows.isEmpty
               ? Center(
                   child: Text(
                     chat?.cursorChatId != null
@@ -636,13 +603,12 @@ class _PromptsTabState extends State<PromptsTab> {
                   // reverse：打开会话时默认停在最新消息（底部）
                   reverse: true,
                   padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
-                  itemCount: messages.length,
+                  itemCount: rows.length,
                   itemBuilder: (context, index) {
-                    final m = messages[messages.length - 1 - index];
-                    return _MessageBubble(
-                      key: ValueKey(m.id),
-                      message: m,
-                      statusHint: _statusHint(m),
+                    final row = rows[rows.length - 1 - index];
+                    return KeyedSubtree(
+                      key: ValueKey(row.key),
+                      child: row.child,
                     );
                   },
                 ),
@@ -669,83 +635,6 @@ class _PromptsTabState extends State<PromptsTab> {
           }),
         ),
       ],
-    );
-  }
-}
-
-class _OtherProjectActivityStrip extends StatelessWidget {
-  const _OtherProjectActivityStrip({
-    required this.activities,
-    required this.projects,
-  });
-
-  final List<ProjectActivity> activities;
-  final List<Project> projects;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      child: Card(
-        margin: EdgeInsets.zero,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                children: [
-                  Icon(Icons.sync_alt, size: 18, color: scheme.primary),
-                  const SizedBox(width: 8),
-                  Text('其他项目动态', style: Theme.of(context).textTheme.labelLarge),
-                ],
-              ),
-              for (final activity in activities.take(3))
-                _activityTile(context, activity),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _activityTile(BuildContext context, ProjectActivity activity) {
-    final scheme = Theme.of(context).colorScheme;
-    final (label, icon, color) = switch (activity.status) {
-      'queued' => ('排队中', Icons.schedule, scheme.tertiary),
-      'delivered' => ('已接收', Icons.download_done, scheme.primary),
-      'running' => ('执行中', Icons.autorenew, scheme.primary),
-      'done' => ('已完成', Icons.check_circle_outline, Colors.green),
-      'failed' => ('执行失败', Icons.error_outline, scheme.error),
-      _ => (activity.status, Icons.info_outline, scheme.onSurfaceVariant),
-    };
-    var projectName = activity.projectId;
-    for (final project in projects) {
-      if (project.id == activity.projectId) {
-        projectName = project.displayName;
-        break;
-      }
-    }
-    final result = activity.result?.trim() ?? '';
-    final detail =
-        (activity.status == 'done' || activity.status == 'failed') &&
-            result.isNotEmpty
-        ? result
-        : activity.content;
-
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      dense: true,
-      visualDensity: VisualDensity.compact,
-      leading: Icon(icon, size: 18, color: color),
-      title: Text(
-        '$projectName · $label',
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-      ),
-      subtitle: Text(detail, maxLines: 1, overflow: TextOverflow.ellipsis),
     );
   }
 }
@@ -1127,13 +1016,16 @@ class _PendingImagePreview extends StatelessWidget {
 
 class _MessageBubble extends StatefulWidget {
   const _MessageBubble({
-    super.key,
     required this.message,
     required this.statusHint,
+    this.showRequest = true,
+    this.showResult = true,
   });
 
   final PromptJob message;
   final String statusHint;
+  final bool showRequest;
+  final bool showResult;
 
   @override
   State<_MessageBubble> createState() => _MessageBubbleState();
@@ -1160,88 +1052,89 @@ class _MessageBubbleState extends State<_MessageBubble>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Align(
-            alignment: fromPc ? Alignment.centerLeft : Alignment.centerRight,
-            child: GestureDetector(
-              onLongPress: fromPc
-                  ? null
-                  : () async {
-                      final text = message.content.trim();
-                      if (text.isEmpty) return;
-                      await Clipboard.setData(ClipboardData(text: text));
-                      if (!context.mounted) return;
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('已复制用户消息'),
-                          duration: Duration(seconds: 1),
-                        ),
-                      );
-                    },
-              child: Container(
-                constraints: BoxConstraints(
-                  maxWidth: MediaQuery.of(context).size.width * 0.82,
-                ),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
-                ),
-                decoration: BoxDecoration(
-                  color: fromPc
-                      ? scheme.secondaryContainer
-                      : scheme.primaryContainer,
-                  borderRadius: BorderRadius.only(
-                    topLeft: const Radius.circular(14),
-                    topRight: const Radius.circular(14),
-                    bottomLeft: Radius.circular(fromPc ? 4 : 14),
-                    bottomRight: Radius.circular(fromPc ? 14 : 4),
+          if (widget.showRequest)
+            Align(
+              alignment: fromPc ? Alignment.centerLeft : Alignment.centerRight,
+              child: GestureDetector(
+                onLongPress: fromPc
+                    ? null
+                    : () async {
+                        final text = message.content.trim();
+                        if (text.isEmpty) return;
+                        await Clipboard.setData(ClipboardData(text: text));
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('已复制用户消息'),
+                            duration: Duration(seconds: 1),
+                          ),
+                        );
+                      },
+                child: Container(
+                  constraints: BoxConstraints(
+                    maxWidth: MediaQuery.of(context).size.width * 0.82,
                   ),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(message.content),
-                    if (toAgent &&
-                        attachment != null &&
-                        attachment.isImage) ...[
-                      const SizedBox(height: 8),
-                      _SentImagePreview(attachment: attachment),
-                    ],
-                    const SizedBox(height: 4),
-                    Text(
-                      statusHint,
-                      style: Theme.of(context).textTheme.labelSmall,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: fromPc
+                        ? scheme.secondaryContainer
+                        : scheme.primaryContainer,
+                    borderRadius: BorderRadius.only(
+                      topLeft: const Radius.circular(14),
+                      topRight: const Radius.circular(14),
+                      bottomLeft: Radius.circular(fromPc ? 4 : 14),
+                      bottomRight: Radius.circular(fromPc ? 14 : 4),
                     ),
-                    if (fromPc) ...[
-                      const SizedBox(height: 8),
-                      _FileDownloadButton(attachment: attachment),
-                    ],
-                    if (toAgent && attachment != null) ...[
-                      const SizedBox(height: 8),
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            attachment.isImage
-                                ? Icons.image
-                                : Icons.attach_file,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 6),
-                          Flexible(
-                            child: Text(
-                              '已发送到 PC：${attachment.fileName}',
-                              style: Theme.of(context).textTheme.labelMedium,
-                            ),
-                          ),
-                        ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(message.content),
+                      if (toAgent &&
+                          attachment != null &&
+                          attachment.isImage) ...[
+                        const SizedBox(height: 8),
+                        _SentImagePreview(attachment: attachment),
+                      ],
+                      const SizedBox(height: 4),
+                      Text(
+                        statusHint,
+                        style: Theme.of(context).textTheme.labelSmall,
                       ),
+                      if (fromPc) ...[
+                        const SizedBox(height: 8),
+                        _FileDownloadButton(attachment: attachment),
+                      ],
+                      if (toAgent && attachment != null) ...[
+                        const SizedBox(height: 8),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              attachment.isImage
+                                  ? Icons.image
+                                  : Icons.attach_file,
+                              size: 18,
+                            ),
+                            const SizedBox(width: 6),
+                            Flexible(
+                              child: Text(
+                                '已发送到 PC：${attachment.fileName}',
+                                style: Theme.of(context).textTheme.labelMedium,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
               ),
             ),
-          ),
-          if (hasResult && !fromPc) ...[
+          if (widget.showResult && hasResult && !fromPc) ...[
             const SizedBox(height: 6),
             Align(
               alignment: Alignment.centerLeft,

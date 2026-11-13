@@ -48,6 +48,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   static const _kRecentWorkspaces = 'recent_workspace_paths';
   static const _kScheduledPrompts = 'scheduled_prompts';
   static const _kHiddenProjectIds = 'hidden_project_ids';
+  static const _kProjectSnapshotSyncEpochPrefix =
+      'project_snapshot_sync_epoch_';
+  // Bump when connected cloud projects have changed; existing clients then
+  // fetch the full list once and keep using the local snapshot afterward.
+  static const _projectSnapshotSyncEpoch = 2;
+  static const _kProjectSnapshotPrefix = 'project_snapshot_v1_';
 
   /// `cloud` = mcp-x 账号登录；`lan` = 内网中继地址 + Token
   String connectionMode = 'cloud';
@@ -102,6 +108,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Timer? _reconnectTimer;
   Timer? _progressPollTimer;
   Timer? _scheduledPromptTimer;
+  int _wsReconnectAttempt = 0;
+  String _clientScope = '';
+  Future<void> _persistProjectCache = Future<void>.value();
+  bool _wsConnected = false;
   bool _scheduledPromptsLoaded = false;
   bool _scheduledPromptDispatching = false;
   bool _appForeground = true;
@@ -168,6 +178,60 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       out.add(p);
     }
     return out;
+  }
+
+  void _setProjects(List<Project> input) {
+    projects = _dedupeProjects(input);
+    if (_clientScope.isEmpty) return;
+    final snapshot = jsonEncode(
+      projects.map((project) => project.toJson()).toList(),
+    );
+    final snapshotKey = '$_kProjectSnapshotPrefix$_clientScope';
+    _persistProjectCache = _persistProjectCache
+        .catchError((Object _) {})
+        .then((_) async {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString(snapshotKey, snapshot);
+        })
+        .catchError((Object _) {});
+  }
+
+  Future<bool> _restoreProjectSnapshot(String scope) async {
+    final prefs = await SharedPreferences.getInstance();
+    final snapshot = prefs.getString('$_kProjectSnapshotPrefix$scope');
+    if (snapshot == null || snapshot.isEmpty) return false;
+    try {
+      final decoded = jsonDecode(snapshot);
+      if (decoded is! List) return false;
+      _setProjects(
+        decoded
+            .whereType<Map>()
+            .map((item) => Project.fromJson(Map<String, dynamic>.from(item)))
+            .toList(),
+      );
+      return true;
+    } catch (_) {
+      // 损坏的本地快照不影响后续从服务端重新同步。
+      return false;
+    }
+  }
+
+  Future<void> _loadCachedSession() async {
+    if (activeProjectId == null ||
+        !visibleProjects.any((project) => project.id == activeProjectId)) {
+      final candidates = visibleProjects;
+      final online = candidates.where(
+        (project) => project.isEffectivelyOnline(),
+      );
+      activeProjectId = online.isNotEmpty
+          ? online.first.id
+          : (candidates.isNotEmpty ? candidates.first.id : null);
+    }
+    await refreshCodexUsage();
+    await _loadChatSessionsForActiveProject();
+    await _loadMessagesForActiveChat();
+    await _persistSelection();
+    notifyListeners();
   }
 
   ChatSession? get activeChatSession {
@@ -277,6 +341,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _wsSub = null;
     await _ws?.sink.close();
     _ws = null;
+    _wsConnected = false;
     _reconnectTimer?.cancel();
     _progressPollTimer?.cancel();
     _scheduledPromptTimer?.cancel();
@@ -390,12 +455,33 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> connect() async {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     connecting = true;
     error = null;
     notifyListeners();
     _api = ApiClient(baseUrl: serverUrl, token: token);
     try {
-      await refreshAll();
+      _clientScope = Uri.encodeComponent('$serverUrl|$username');
+      final prefs = await SharedPreferences.getInstance();
+      final hasProjectSnapshot = await _restoreProjectSnapshot(_clientScope);
+      if (hasProjectSnapshot) {
+        final syncEpochKey = '$_kProjectSnapshotSyncEpochPrefix$_clientScope';
+        if ((prefs.getInt(syncEpochKey) ?? 0) < _projectSnapshotSyncEpoch) {
+          try {
+            _setProjects(await _api!.listProjects());
+            await _persistProjectCache;
+            await prefs.setInt(syncEpochKey, _projectSnapshotSyncEpoch);
+          } catch (e) {
+            error = '项目同步失败: $e';
+          }
+        }
+        await _loadCachedSession();
+      } else {
+        // 首次安装或切换账号时只做一次初始同步；之后使用本地项目清单。
+        await refreshAll();
+      }
+      _wsReconnectAttempt = 0;
       _connectWs();
       _ensureProgressPolling();
       _syncScheduledPromptTimer();
@@ -405,7 +491,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       connecting = false;
       error = e.toString();
       notifyListeners();
-      _scheduleReconnect();
+      _scheduleReconnect(refreshData: true);
     }
   }
 
@@ -414,9 +500,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (api == null) return;
     final errors = <String>[];
     try {
-      projects = _dedupeProjects(await api.listProjects());
+      _setProjects(await api.listProjects());
+      await _persistProjectCache;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(
+        '$_kProjectSnapshotSyncEpochPrefix$_clientScope',
+        _projectSnapshotSyncEpoch,
+      );
     } catch (e) {
-      projects = [];
       errors.add('项目: $e');
     }
     try {
@@ -751,11 +842,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     String status = (created['status'] as String?) ?? 'queued';
     String? err = created['error'] as String?;
 
-    // 等待 PC 认领执行（最多约 20s），期间多次刷新项目列表
-    for (var i = 0; i < 10; i++) {
-      await Future<void>.delayed(const Duration(milliseconds: 1800));
-      await refreshAll();
-      if (id != null) {
+    // 等待 PC 认领执行（最多约 20s），只查询该指令状态，不重复拉取整批数据。
+    if (id != null && status != 'done' && status != 'failed') {
+      for (var i = 0; i < 10; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 1800));
         try {
           final st = await api.getOpenWorkspaceStatus(id);
           status = (st['status'] as String?) ?? status;
@@ -766,15 +856,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         }
       }
     }
-    await refreshAll();
-
     if (status == 'failed') {
       throw Exception(err?.isNotEmpty == true ? err! : 'PC 打开项目失败');
     }
     if (status == 'queued' || status == 'claimed') {
       return '已下发打开指令，请稍后点刷新查看新项目（状态：$status）';
     }
-    return 'PC 已打开，项目列表已刷新';
+    return 'PC 已打开；如项目列表未更新，请手动刷新。';
   }
 
   Future<void> selectChatSession(String sessionId) async {
@@ -864,12 +952,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<void> approveTask(String taskId, {String? comment}) async {
     await _api?.submitDecision(taskId, 'approve', comment: comment);
-    await refreshAll();
   }
 
   Future<void> rejectTask(String taskId, {String? comment}) async {
     await _api?.submitDecision(taskId, 'reject', comment: comment);
-    await refreshAll();
   }
 
   Future<void> sendPrompt(String content) async {
@@ -1158,6 +1244,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   void _connectWs() {
     _wsSub?.cancel();
     _ws?.sink.close();
+    _wsConnected = false;
     final httpUrl = serverUrl.replaceAll(RegExp(r'/+$'), '');
     // 云端：.../codeassist/ws ；本地 Node：.../ws
     final wsUrl = '$httpUrl/ws'
@@ -1166,16 +1253,36 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     final uri = Uri.parse('$wsUrl?token=${Uri.encodeComponent(token)}');
     try {
       _ws = WebSocketChannel.connect(uri);
-      _wsSub = _ws!.stream.listen(
+      final channel = _ws!;
+      channel.ready
+          .then((_) {
+            if (identical(_ws, channel)) {
+              _wsConnected = true;
+              _wsReconnectAttempt = 0;
+              _ensureProgressPolling();
+            }
+          })
+          .catchError((Object _) {
+            _onWsDisconnected(channel);
+          });
+      _wsSub = channel.stream.listen(
         _onWsMessage,
-        onError: (_) => _scheduleReconnect(),
-        onDone: _scheduleReconnect,
+        onError: (_) => _onWsDisconnected(channel),
+        onDone: () => _onWsDisconnected(channel),
       );
       _sendSubscribe();
     } catch (_) {
       // WS 失败时仍靠轮询
       _ensureProgressPolling();
+      _scheduleReconnect();
     }
+  }
+
+  void _onWsDisconnected(WebSocketChannel channel) {
+    if (!identical(_ws, channel)) return;
+    _wsConnected = false;
+    _ensureProgressPolling();
+    _scheduleReconnect();
   }
 
   void _sendSubscribe() {
@@ -1212,7 +1319,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
               projects = [p, ...projects];
             }
           }
-          projects = _dedupeProjects(projects);
+          _setProjects(projects);
           notifyListeners();
           break;
         case 'task.created':
@@ -1391,13 +1498,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         hasInFlight: _hasInFlightMessages,
       );
     }());
-    if (_disposed || !_hasInFlightMessages) {
+    if (_disposed || !_hasInFlightMessages || _wsConnected) {
       _progressPollTimer?.cancel();
       _progressPollTimer = null;
       return;
     }
     if (_progressPollTimer != null) return;
-    _progressPollTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+    _progressPollTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
       if (_disposed || !_hasInFlightMessages) {
         _progressPollTimer?.cancel();
         _progressPollTimer = null;
@@ -1423,11 +1530,26 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     });
   }
 
-  void _scheduleReconnect() {
+  void _scheduleReconnect({bool refreshData = false}) {
     if (_disposed || !configured) return;
-    _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(const Duration(seconds: 3), () {
-      if (!_disposed) connect();
+    if (_reconnectTimer != null) return;
+    final delaySeconds = switch (_wsReconnectAttempt) {
+      0 => 3,
+      1 => 6,
+      2 => 12,
+      3 => 24,
+      4 => 48,
+      _ => 60,
+    };
+    if (_wsReconnectAttempt < 5) _wsReconnectAttempt++;
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () {
+      _reconnectTimer = null;
+      if (_disposed) return;
+      if (refreshData) {
+        unawaited(connect());
+      } else {
+        _connectWs();
+      }
     });
   }
 

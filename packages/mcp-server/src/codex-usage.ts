@@ -66,10 +66,12 @@ export function readCodexUsage(): Promise<Omit<SyncCodexUsageRequest, "projectId
       resolve(snapshot);
     };
 
+    stdin.on("error", () => finish(null));
     child.on("error", () => finish(null));
     child.on("exit", () => finish(null));
     stdout.setEncoding("utf8");
     stdout.on("data", (chunk: string) => {
+      if (finished) return;
       buffer += chunk;
       let newline = buffer.indexOf("\n");
       while (newline >= 0) {

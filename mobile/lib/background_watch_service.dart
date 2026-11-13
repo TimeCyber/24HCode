@@ -7,11 +7,15 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'api_client.dart';
+import 'client_update_policy.dart';
 import 'notification_service.dart';
+import 'remote_request.dart';
 
 const kAppForegroundPref = 'app_in_foreground';
 const _kUrl = 'server_url';
 const _kToken = 'access_token';
+const _kUsername = 'username';
 const _kActiveChat = 'active_chat_session_id';
 const _kNotifiedIds = 'bg_notified_prompt_ids';
 const _kWatchingIds = 'bg_watching_prompt_ids';
@@ -34,7 +38,7 @@ class BackgroundWatchService {
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'codeassist_watch',
         channelName: '任务监听',
-        channelDescription: '应用在后台时监听 AI 任务完成',
+        channelDescription: '应用在后台时监听待确认请求和任务结果',
         onlyAlertOnce: true,
       ),
       iosNotificationOptions: const IOSNotificationOptions(
@@ -42,7 +46,7 @@ class BackgroundWatchService {
         playSound: false,
       ),
       foregroundTaskOptions: ForegroundTaskOptions(
-        eventAction: ForegroundTaskEventAction.repeat(2500),
+        eventAction: ForegroundTaskEventAction.repeat(10000),
         autoRunOnBoot: false,
         autoRunOnMyPackageReplaced: false,
         allowWakeLock: true,
@@ -102,7 +106,7 @@ class BackgroundWatchService {
     if (await FlutterForegroundTask.isRunningService) {
       await FlutterForegroundTask.updateService(
         notificationTitle: 'CodeAssist 正在等待任务完成',
-        notificationText: '可切到后台，完成后会推送通知',
+        notificationText: '可切到后台，待确认或完成时会提醒',
       );
       return;
     }
@@ -111,7 +115,7 @@ class BackgroundWatchService {
     await FlutterForegroundTask.startService(
       serviceTypes: const [ForegroundServiceTypes.dataSync],
       notificationTitle: 'CodeAssist 正在等待任务完成',
-      notificationText: '可切到后台，完成后会推送通知',
+      notificationText: '可切到后台，待确认或完成时会提醒',
       callback: codeAssistStartCallback,
     );
   }
@@ -130,19 +134,6 @@ class CodeAssistWatchHandler extends TaskHandler {
     _pluginsReady = true;
   }
 
-  bool _isInFlight(String status, String? result) {
-    if (status == 'done' || status == 'failed') return false;
-    if (result != null && result.trim().isNotEmpty) return false;
-    return status == 'queued' ||
-        status == 'delivered' ||
-        status == 'running';
-  }
-
-  bool _isTerminal(String status, String? result) {
-    if (status == 'done' || status == 'failed') return true;
-    return result != null && result.trim().isNotEmpty;
-  }
-
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     await _ensurePlugins();
@@ -157,6 +148,26 @@ class CodeAssistWatchHandler extends TaskHandler {
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
 
+  Future<bool> _pollApprovals(String url, String token, String scope) async {
+    final api = ApiClient(baseUrl: url, token: token);
+    try {
+      final tasks = await api
+          .listTasks(status: 'awaiting_decision')
+          .timeout(const Duration(seconds: 10));
+      final pending = tasks.where(isPendingApproval).toList();
+      for (final task in pending) {
+        try {
+          await NotificationService.instance.showPendingApproval(task, scope);
+        } catch (_) {
+          // The next poll can retry a notification that did not appear.
+        }
+      }
+      return pending.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _pollOnce() async {
     if (_polling) return;
     _polling = true;
@@ -164,16 +175,19 @@ class CodeAssistWatchHandler extends TaskHandler {
       await _ensurePlugins();
       final prefs = await SharedPreferences.getInstance();
       await prefs.reload();
+      if (prefs.getBool(kAppForegroundPref) ?? true) return;
 
       final url = prefs.getString(_kUrl);
       final token = prefs.getString(_kToken);
       final chatId = prefs.getString(_kActiveChat);
-      if (url == null ||
-          token == null ||
-          chatId == null ||
-          url.isEmpty ||
-          token.isEmpty ||
-          chatId.isEmpty) {
+      if (url == null || token == null || url.isEmpty || token.isEmpty) {
+        return;
+      }
+      final username = prefs.getString(_kUsername) ?? '';
+      final scope = Uri.encodeComponent('$url|$username');
+      final pendingApprovals = _pollApprovals(url, token, scope);
+      if (chatId == null || chatId.isEmpty) {
+        await pendingApprovals;
         return;
       }
 
@@ -182,6 +196,7 @@ class CodeAssistWatchHandler extends TaskHandler {
       final res = await http
           .get(uri, headers: {'Authorization': 'Bearer $token'})
           .timeout(const Duration(seconds: 12));
+      final hasPendingApproval = await pendingApprovals;
       if (res.statusCode < 200 || res.statusCode >= 300) return;
 
       final list = jsonDecode(res.body) as List<dynamic>;
@@ -190,6 +205,7 @@ class CodeAssistWatchHandler extends TaskHandler {
       final watching = (prefs.getStringList(_kWatchingIds) ?? []).toSet();
       var didNotify = false;
       var watchingChanged = false;
+      final now = DateTime.now();
 
       for (final raw in list) {
         if (raw is! Map<String, dynamic>) continue;
@@ -199,24 +215,23 @@ class CodeAssistWatchHandler extends TaskHandler {
         final result = (raw['result'] as String?)?.trim();
 
         final prev = _lastStatus[id];
-        final effectiveStatus = _isTerminal(status, result) &&
-                status != 'done' &&
-                status != 'failed'
-            ? 'done'
-            : status;
+        final effectiveStatus = displayPromptStatus(
+          status,
+          result,
+          raw['updatedAt'] as String? ?? '',
+          now,
+        );
 
-        if (_isInFlight(status, result)) {
+        if (isActivePromptStatus(effectiveStatus)) {
           hasInFlight = true;
           if (watching.add(id)) watchingChanged = true;
         }
 
         final wasWatching = watching.contains(id);
-        final becameTerminal = _isTerminal(status, result) &&
-            (prev == 'queued' ||
-                prev == 'delivered' ||
-                prev == 'running' ||
-                // 服务重启丢了内存态时：只要曾在 watching 列表里，终态也要推
-                (prev == null && wasWatching));
+        final becameTerminal =
+            isTerminalPromptStatus(effectiveStatus) &&
+            (isActivePromptStatus(prev ?? '') ||
+                ((prev == null || prev == 'stale') && wasWatching));
 
         _lastStatus[id] = effectiveStatus;
 
@@ -226,7 +241,7 @@ class CodeAssistWatchHandler extends TaskHandler {
           continue;
         }
 
-        final ok = status != 'failed';
+        final ok = effectiveStatus != 'failed';
         final content = (raw['content'] as String?)?.trim() ?? '';
         final preview = (result != null && result.isNotEmpty)
             ? result
@@ -245,8 +260,9 @@ class CodeAssistWatchHandler extends TaskHandler {
           if (watching.remove(id)) watchingChanged = true;
           await FlutterForegroundTask.updateService(
             notificationTitle: ok ? '任务完成' : '任务失败',
-            notificationText:
-                body.length > 60 ? '${body.substring(0, 60)}…' : body,
+            notificationText: body.length > 60
+                ? '${body.substring(0, 60)}…'
+                : body,
           );
           didNotify = true;
         } catch (e) {
@@ -270,7 +286,12 @@ class CodeAssistWatchHandler extends TaskHandler {
         await prefs.setStringList(_kWatchingIds, watching.toList());
       }
 
-      if (!hasInFlight) {
+      if (hasPendingApproval) {
+        await FlutterForegroundTask.updateService(
+          notificationTitle: 'CodeAssist 有待确认请求',
+          notificationText: '打开应用查看并处理',
+        );
+      } else if (!hasInFlight) {
         if (didNotify || watching.isEmpty) {
           if (didNotify) {
             await Future<void>.delayed(const Duration(milliseconds: 1200));
@@ -287,7 +308,7 @@ class CodeAssistWatchHandler extends TaskHandler {
       } else {
         await FlutterForegroundTask.updateService(
           notificationTitle: 'CodeAssist 正在等待任务完成',
-          notificationText: '后台监听中…完成后会推送',
+          notificationText: '后台监听中，待确认或完成时会提醒',
         );
       }
     } catch (e) {

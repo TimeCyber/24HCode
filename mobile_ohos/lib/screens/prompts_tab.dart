@@ -108,11 +108,9 @@ class _PromptsTabState extends State<PromptsTab> {
   }
 
   Future<void> _openProjectPicker() async {
-    // 与标题栏「目录」一致：先弹层再后台刷新，避免 refreshAll 卡住导致连点堆多个 sheet
+    // 本地快照即时展示；需要更新项目清单时可使用手动刷新。
     if (_projectPickerOpen) return;
     _projectPickerOpen = true;
-    final state = context.read<AppState>();
-    unawaited(state.refreshAll());
     try {
       if (!mounted) return;
       await showModalBottomSheet<void>(

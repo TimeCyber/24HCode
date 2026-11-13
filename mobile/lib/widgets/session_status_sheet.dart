@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
+import '../client_update_policy.dart';
 import '../models.dart';
 import 'linkified_text.dart';
 
@@ -25,6 +26,17 @@ class _SessionStatusSheet extends StatelessWidget {
         final chat = state.activeChatSession;
         final messages = state.chatMessages;
         final scheme = Theme.of(context).colorScheme;
+        final now = DateTime.now();
+        final contextStatus = chat?.contextStatus?.trim();
+        final staleContext =
+            chat != null &&
+            const {
+              'coding',
+              'thinking',
+              'waiting_user',
+            }.contains(contextStatus) &&
+            displayPromptStatus('running', null, chat.updatedAt, now) ==
+                'stale';
         PromptJob? latestWithResult;
         PromptJob? inFlight;
         for (final m in messages.reversed) {
@@ -32,9 +44,9 @@ class _SessionStatusSheet extends StatelessWidget {
           final hasResult = r != null && r.isNotEmpty;
           if (hasResult) {
             latestWithResult ??= m;
-          } else if (m.status == 'queued' ||
-              m.status == 'delivered' ||
-              m.status == 'running') {
+          } else if (isActivePromptStatus(
+            displayPromptStatus(m.status, m.result, m.updatedAt, now),
+          )) {
             inFlight ??= m;
           }
           if (latestWithResult != null && inFlight != null) break;
@@ -63,8 +75,8 @@ class _SessionStatusSheet extends StatelessWidget {
                     Text(
                       chat?.title ?? '未选择会话',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: scheme.onSurfaceVariant,
-                          ),
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                     const SizedBox(height: 16),
                     _SectionCard(
@@ -72,9 +84,11 @@ class _SessionStatusSheet extends StatelessWidget {
                       child: Text(
                         inFlight != null
                             ? '进行中 · ${_statusLabel(inFlight.status)}'
-                            : (chat?.contextStatus?.trim().isNotEmpty == true
-                                ? chat!.contextStatus!
-                                : '空闲'),
+                            : staleContext
+                            ? '状态未更新'
+                            : (contextStatus?.isNotEmpty == true
+                                  ? contextStatus!
+                                  : '空闲'),
                         style: Theme.of(context).textTheme.bodyLarge,
                       ),
                     ),
@@ -130,8 +144,8 @@ class _SessionStatusSheet extends StatelessWidget {
                         '暂无会话上下文或结果',
                         textAlign: TextAlign.center,
                         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: scheme.onSurfaceVariant,
-                            ),
+                          color: scheme.onSurfaceVariant,
+                        ),
                       ),
                     ],
                     const SizedBox(height: 8),
@@ -182,9 +196,9 @@ class _SectionCard extends StatelessWidget {
           children: [
             Text(
               title,
-              style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                    color: scheme.primary,
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.labelLarge?.copyWith(color: scheme.primary),
             ),
             const SizedBox(height: 6),
             child,

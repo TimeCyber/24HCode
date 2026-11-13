@@ -94,6 +94,25 @@ class ApiClient {
         .toList();
   }
 
+  Future<List<ProjectActivity>> listProjectDeliveries(String projectId) async {
+    final res = await http
+        .get(
+          _uri('/api/prompts', {'projectId': projectId}),
+          headers: _authHeaders,
+        )
+        .timeout(const Duration(seconds: 12));
+    _ensureOk(res);
+    return _asList(res.body)
+        .map((row) {
+          final value = Map<String, dynamic>.from(row as Map);
+          value['promptId'] ??= value['id'];
+          value['projectId'] ??= projectId;
+          return ProjectActivity.fromJson(value);
+        })
+        .where((item) => !item.isIncomingFile)
+        .toList();
+  }
+
   /// 请求 PC 端打开工作区（在线 MCP/桥接执行）
   Future<Map<String, dynamic>> openWorkspace({
     required String workspacePath,
@@ -126,7 +145,7 @@ class ApiClient {
   Future<List<TaskEvent>> listTasks({String? status}) async {
     final res = await http.get(
       _uri('/api/tasks', status == null ? null : {'status': status}),
-      headers: _headers,
+      headers: _authHeaders,
     );
     _ensureOk(res);
     final list = _asList(res.body);
@@ -135,7 +154,7 @@ class ApiClient {
         .toList();
   }
 
-  Future<void> submitDecision(
+  Future<TaskEvent> submitDecision(
     String taskId,
     String action, {
     String? comment,
@@ -149,6 +168,8 @@ class ApiClient {
       }),
     );
     _ensureOk(res);
+    final result = _asMap(res.body);
+    return TaskEvent.fromJson(Map<String, dynamic>.from(result['task'] as Map));
   }
 
   Future<List<ChatSession>> listChatSessions({String? projectId}) async {
@@ -180,31 +201,6 @@ class ApiClient {
     );
     _ensureOk(res);
     return ChatSession.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
-  }
-
-  Future<void> updateChatSession(
-    String sessionId, {
-    String? cursorChatId,
-  }) async {
-    final res = await http.patch(
-      _uri('/api/chat-sessions/$sessionId'),
-      headers: _headers,
-      body: jsonEncode({'cursorChatId': ?cursorChatId}),
-    );
-    _ensureOk(res);
-  }
-
-  Future<List<CodexDesktopSession>> listCodexDesktopSessions(
-    String projectId,
-  ) async {
-    final res = await http.get(
-      _uri('/api/codex-sessions/$projectId'),
-      headers: _headers,
-    );
-    _ensureOk(res);
-    return _asList(res.body)
-        .map((e) => CodexDesktopSession.fromJson(e as Map<String, dynamic>))
-        .toList();
   }
 
   Future<void> deleteChatSession(String sessionId) async {
@@ -276,6 +272,7 @@ class ApiClient {
       }),
     );
     _ensureOk(res);
+    _asMap(res.body);
   }
 
   Future<List<SessionContext>> listSessionContexts() async {
@@ -322,6 +319,7 @@ class ApiClient {
       }),
     );
     _ensureOk(res);
+    _asMap(res.body);
   }
 
   /// 生成配对码（手机端）

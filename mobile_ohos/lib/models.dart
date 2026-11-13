@@ -40,6 +40,15 @@ class Project {
     online: json['online'] as bool? ?? false,
   );
 
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'workspacePath': workspacePath,
+    'ide': ide,
+    'lastSeenAt': lastSeenAt,
+    'online': online,
+  };
+
   /// mcp.json 变量未展开时 name 会是 ${workspaceFolderBasename}
   String get displayName {
     if (name.contains(r'${') || name.trim().isEmpty) {

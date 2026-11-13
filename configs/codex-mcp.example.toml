@@ -2,6 +2,7 @@
 # TOKEN 须与中继 ACCESS_TOKEN 一致；IDE 必须为 codex
 
 [mcp_servers.codeassist]
+tool_call_timeout_sec = 1260
 command = 'C:\nvm4w\nodejs\node.exe'
 args = ["D:/androidproject/CodeAssit/packages/mcp-server/run.mjs"]
 

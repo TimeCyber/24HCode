@@ -7,11 +7,28 @@ import '../widgets/session_status_sheet.dart';
 import 'crash_log_screen.dart';
 import 'devices_screen.dart';
 import 'prompts_tab.dart';
+import 'projects_tab.dart';
 import 'scheduled_prompts_screen.dart';
 import 'setup_screen.dart';
+import 'tasks_tab.dart';
 
 class HomeShell extends StatelessWidget {
-  const HomeShell({super.key});
+  const HomeShell({super.key, this.showProjects = true});
+  final bool showProjects;
+
+  Future<void> _openProject(
+    BuildContext context,
+    String projectId,
+    String? chatId,
+  ) async {
+    final state = context.read<AppState>();
+    await state.selectProject(projectId);
+    if (chatId != null) await state.selectChatSession(chatId);
+    if (!context.mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(builder: (_) => const HomeShell(showProjects: false)),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -36,26 +53,27 @@ class HomeShell extends StatelessWidget {
           children: [
             Flexible(
               child: Text(
-                project?.displayName ?? 'CodeAssist',
+                showProjects ? '项目' : project?.displayName ?? 'CodeAssist',
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-            const SizedBox(width: 8),
-            Tooltip(
-              message: state.connecting
-                  ? '连接中'
-                  : (project == null
-                        ? '未选择项目'
-                        : (project.isEffectivelyOnline() ? '项目在线' : '项目离线')),
-              child: Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: statusDot,
-                  shape: BoxShape.circle,
+            if (!showProjects) const SizedBox(width: 8),
+            if (!showProjects)
+              Tooltip(
+                message: state.connecting
+                    ? '连接中'
+                    : (project == null
+                          ? '未选择项目'
+                          : (project.isEffectivelyOnline() ? '项目在线' : '项目离线')),
+                child: Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: statusDot,
+                    shape: BoxShape.circle,
+                  ),
                 ),
               ),
-            ),
           ],
         ),
         actions: [
@@ -77,11 +95,12 @@ class HomeShell extends StatelessWidget {
             ),
             icon: const Icon(Icons.schedule),
           ),
-          IconButton(
-            tooltip: '本会话状态',
-            onPressed: () => showSessionStatusSheet(context),
-            icon: const Icon(Icons.info_outline),
-          ),
+          if (!showProjects)
+            IconButton(
+              tooltip: '本会话状态',
+              onPressed: () => showSessionStatusSheet(context),
+              icon: const Icon(Icons.info_outline),
+            ),
           IconButton(
             tooltip: '刷新',
             onPressed: () => state.refreshAll(),
@@ -90,11 +109,26 @@ class HomeShell extends StatelessWidget {
           PopupMenuButton<String>(
             tooltip: '更多',
             onSelected: (v) async {
-              if (v == 'project') {
+              if (v == 'tasks') {
                 await showModalBottomSheet<void>(
                   context: context,
                   isScrollControlled: true,
-                  builder: (_) => const _ProjectSheet(),
+                  builder: (ctx) => SafeArea(
+                    child: SizedBox(
+                      height: MediaQuery.of(ctx).size.height * 0.8,
+                      child: const TasksTab(),
+                    ),
+                  ),
+                );
+              } else if (v == 'project') {
+                await showModalBottomSheet<void>(
+                  context: context,
+                  isScrollControlled: true,
+                  builder: (_) => _ProjectSheet(
+                    onOpenProject: showProjects
+                        ? (id) => _openProject(context, id, null)
+                        : null,
+                  ),
                 );
               } else if (v == 'crash') {
                 Navigator.of(context).push(
@@ -114,13 +148,23 @@ class HomeShell extends StatelessWidget {
               } else if (v == 'logout') {
                 await state.logout();
                 if (context.mounted) {
-                  ScaffoldMessenger.of(
-                    context,
-                  ).showSnackBar(const SnackBar(content: Text('已断开连接')));
+                  final messenger = ScaffoldMessenger.of(context);
+                  if (!showProjects) {
+                    Navigator.of(context).popUntil((route) => route.isFirst);
+                  }
+                  messenger.showSnackBar(
+                    const SnackBar(content: Text('已断开连接')),
+                  );
                 }
               }
             },
             itemBuilder: (_) => [
+              PopupMenuItem(
+                value: 'tasks',
+                child: Text(
+                  '任务与确认（${state.tasks.where((t) => t.status == "awaiting_decision").length}）',
+                ),
+              ),
               const PopupMenuItem(value: 'project', child: Text('选择 / 打开项目')),
               const PopupMenuItem(value: 'setup', child: Text('连接设置 / 账号')),
               if (!state.isLanMode)
@@ -146,18 +190,25 @@ class HomeShell extends StatelessWidget {
                 ),
               ],
             ),
-          if (project?.ide == 'codex')
-            _CodexUsageCard(usage: state.activeCodexUsage),
+          if (showProjects && project?.ide == 'codex')
+            _CodexUsageButton(usage: state.activeCodexUsage),
           if (state.needsDevicePairing) const _PairDeviceBanner(),
-          const Expanded(child: PromptsTab()),
+          Expanded(
+            child: showProjects
+                ? ProjectsTab(
+                    onOpenProject: (id, chatId) =>
+                        _openProject(context, id, chatId),
+                  )
+                : const PromptsTab(),
+          ),
         ],
       ),
     );
   }
 }
 
-class _CodexUsageCard extends StatelessWidget {
-  const _CodexUsageCard({required this.usage});
+class _CodexUsageButton extends StatelessWidget {
+  const _CodexUsageButton({required this.usage});
 
   final CodexUsageSnapshot? usage;
 
@@ -170,78 +221,175 @@ class _CodexUsageCard extends StatelessWidget {
         DateTime.now().difference(updated) > const Duration(minutes: 10);
     final plan = usage?.planType;
 
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      child: OutlinedButton(
+        style: OutlinedButton.styleFrom(
+          alignment: Alignment.centerLeft,
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          foregroundColor: colors.onSurface,
+          side: BorderSide(color: colors.outlineVariant),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+        onPressed: () => _showDetails(context),
+        child: Row(
           children: [
-            Row(
-              children: [
-                const Icon(Icons.data_usage, size: 18),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
+            Icon(Icons.data_usage, color: colors.primary, size: 20),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
                     'Codex 额度${plan == null ? '' : ' · ${_planLabel(plan)}'}',
+                    style: Theme.of(context).textTheme.labelMedium,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    _remainingSummary(usage),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: Theme.of(context).textTheme.titleSmall,
                   ),
-                ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
                 Text(
                   updated == null
                       ? '等待同步'
-                      : '${stale ? '数据较旧 · ' : ''}${_clockLabel(updated)}',
+                      : '${stale ? '较旧 · ' : ''}${_clockLabel(updated)}',
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
                     color: stale ? colors.error : colors.onSurfaceVariant,
                   ),
                 ),
+                Icon(Icons.chevron_right, color: colors.onSurfaceVariant),
               ],
             ),
-            if (usage == null) ...[
-              const SizedBox(height: 6),
-              Text(
-                '等待电脑端 Codex 同步用量；请确认 Codex CLI 已登录。',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ] else ...[
-              const SizedBox(height: 8),
-              if (usage!.primary != null)
-                _CodexUsageWindowRow(window: usage!.primary!),
-              if (usage!.primary != null && usage!.secondary != null)
-                const SizedBox(height: 8),
-              if (usage!.secondary != null)
-                _CodexUsageWindowRow(window: usage!.secondary!),
-              if (usage!.primary == null && usage!.secondary == null)
-                Text(
-                  '当前没有可展示的额度窗口。',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-            ],
           ],
         ),
       ),
     );
   }
 
-  static String _planLabel(String value) {
-    switch (value.toLowerCase()) {
-      case 'plus':
-        return 'Plus';
-      case 'pro':
-        return 'Pro';
-      case 'team':
-        return 'Team';
-      case 'business':
-        return 'Business';
-      case 'enterprise':
-        return 'Enterprise';
-      default:
-        return value;
-    }
+  void _showDetails(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (_) => SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+        child: _CodexUsageDetails(usage: usage),
+      ),
+    );
   }
 
-  static String _clockLabel(DateTime value) =>
-      '${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
+  static String _remainingSummary(CodexUsageSnapshot? usage) {
+    if (usage == null) return '等待电脑端同步用量';
+    final windows = [
+      if (usage.primary != null)
+        '${_shortWindowLabel(usage.primary!.windowDurationMins)}剩余 ${usage.primary!.remainingPercent}%',
+      if (usage.secondary != null)
+        '${_shortWindowLabel(usage.secondary!.windowDurationMins)}剩余 ${usage.secondary!.remainingPercent}%',
+    ];
+    return windows.isEmpty ? '当前没有可展示的额度窗口' : windows.join(' · ');
+  }
+}
+
+class _CodexUsageDetails extends StatelessWidget {
+  const _CodexUsageDetails({required this.usage});
+
+  final CodexUsageSnapshot? usage;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final updated = DateTime.tryParse(usage?.updatedAt ?? '')?.toLocal();
+    final stale =
+        updated == null ||
+        DateTime.now().difference(updated) > const Duration(minutes: 10);
+    final plan = usage?.planType;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.data_usage, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Codex 用量详情${plan == null ? '' : ' · ${_planLabel(plan)}'}',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+            Text(
+              updated == null
+                  ? '等待同步'
+                  : '${stale ? '数据较旧 · ' : ''}${_clockLabel(updated)}',
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: stale ? colors.error : colors.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+        if (usage == null) ...[
+          const SizedBox(height: 12),
+          Text(
+            '等待电脑端 Codex 同步用量；请确认 Codex CLI 已登录。',
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+        ] else ...[
+          const SizedBox(height: 16),
+          if (usage!.primary != null)
+            _CodexUsageWindowRow(window: usage!.primary!),
+          if (usage!.primary != null && usage!.secondary != null)
+            const SizedBox(height: 16),
+          if (usage!.secondary != null)
+            _CodexUsageWindowRow(window: usage!.secondary!),
+          if (usage!.primary == null && usage!.secondary == null)
+            Text(
+              '当前没有可展示的额度窗口。',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+        ],
+      ],
+    );
+  }
+}
+
+String _planLabel(String value) {
+  switch (value.toLowerCase()) {
+    case 'plus':
+      return 'Plus';
+    case 'pro':
+      return 'Pro';
+    case 'team':
+      return 'Team';
+    case 'business':
+      return 'Business';
+    case 'enterprise':
+      return 'Enterprise';
+    default:
+      return value;
+  }
+}
+
+String _clockLabel(DateTime value) =>
+    '${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
+
+String _shortWindowLabel(int minutes) {
+  if (minutes == 300) return '5 小时';
+  if (minutes == 10080) return '每周';
+  if (minutes % 1440 == 0) return '${minutes ~/ 1440} 天';
+  if (minutes % 60 == 0) return '${minutes ~/ 60} 小时';
+  return '$minutes 分钟';
 }
 
 class _CodexUsageWindowRow extends StatelessWidget {
@@ -364,7 +512,8 @@ class _PairDeviceBanner extends StatelessWidget {
 }
 
 class _ProjectSheet extends StatelessWidget {
-  const _ProjectSheet();
+  const _ProjectSheet({this.onOpenProject});
+  final Future<void> Function(String id)? onOpenProject;
 
   @override
   Widget build(BuildContext context) {
@@ -496,7 +645,10 @@ class _ProjectSheet extends StatelessWidget {
                               ),
                               onTap: () async {
                                 await s.selectProject(p.id);
-                                if (context.mounted) Navigator.pop(context);
+                                if (context.mounted) {
+                                  Navigator.pop(context);
+                                  await onOpenProject?.call(p.id);
+                                }
                               },
                             );
                           },

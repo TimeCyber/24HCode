@@ -5,6 +5,6 @@ void main() {
   testWidgets('App boots', (WidgetTester tester) async {
     await tester.pumpWidget(const CodeAssistApp());
     await tester.pump();
-    expect(find.text('CodeAssist'), findsWidgets);
+    expect(find.text('连接'), findsOneWidget);
   });
 }

@@ -55,6 +55,9 @@ if (mergedDupes > 0) {
 // 文件以 Base64 JSON 上传，100MB 原文约 133MB，body 放宽到 150MB
 const app = Fastify({
   logger: true,
+  // 避免客户端心跳、列表同步和实时状态轮询把每个请求都写入服务日志。
+  // Fastify 仍会记录错误，业务代码的显式日志也保持可见。
+  disableRequestLogging: true,
   bodyLimit: 150 * 1024 * 1024,
 });
 await app.register(cors, { origin: true });

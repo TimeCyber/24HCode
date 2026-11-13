@@ -34,6 +34,13 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    packaging {
+        jniLibs {
+            // Keep standalone APKs small enough to send through the relay.
+            useLegacyPackaging = true
+        }
+    }
 }
 
 kotlin {

@@ -40,6 +40,15 @@ class Project {
     online: json['online'] as bool? ?? false,
   );
 
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'workspacePath': workspacePath,
+    'ide': ide,
+    'lastSeenAt': lastSeenAt,
+    'online': online,
+  };
+
   /// mcp.json 变量未展开时 name 会是 ${workspaceFolderBasename}
   String get displayName {
     if (name.contains(r'${') || name.trim().isEmpty) {
@@ -114,33 +123,6 @@ class CodexUsageSnapshot {
                 Map<String, dynamic>.from(json['secondary'] as Map),
               ),
         updatedAt: json['updatedAt'] as String,
-      );
-}
-
-class CodexDesktopSession {
-  const CodexDesktopSession({
-    required this.id,
-    required this.title,
-    this.preview,
-    required this.source,
-    required this.updatedAt,
-  });
-
-  final String id;
-  final String title;
-  final String? preview;
-  final String source;
-
-  /// Unix timestamp in seconds from the local Codex app-server.
-  final int updatedAt;
-
-  factory CodexDesktopSession.fromJson(Map<String, dynamic> json) =>
-      CodexDesktopSession(
-        id: json['id'] as String,
-        title: json['title'] as String,
-        preview: json['preview'] as String?,
-        source: json['source'] as String? ?? 'unknown',
-        updatedAt: (json['updatedAt'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -383,6 +365,9 @@ class ProjectActivity {
     required this.status,
     required this.updatedAt,
     this.result,
+    this.chatSessionId,
+    this.isIncomingFile = false,
+    this.createdAt,
   });
 
   final String id;
@@ -392,6 +377,13 @@ class ProjectActivity {
   final String status;
   final String updatedAt;
   final String? result;
+  final String? chatSessionId;
+  final bool isIncomingFile;
+  final String? createdAt;
+  late final int updatedMillis =
+      DateTime.tryParse(updatedAt)?.millisecondsSinceEpoch ?? 0;
+  bool get isInFlight =>
+      status == 'queued' || status == 'delivered' || status == 'running';
 
   factory ProjectActivity.fromJson(Map<String, dynamic> json) =>
       ProjectActivity(
@@ -401,7 +393,12 @@ class ProjectActivity {
         content: json['content'] as String,
         status: json['status'] as String,
         updatedAt: json['updatedAt'] as String,
+        createdAt: json['createdAt'] as String?,
         result: json['result'] as String?,
+        chatSessionId: json['chatSessionId'] as String?,
+        isIncomingFile:
+            json['attachment'] is Map &&
+            (json['attachment'] as Map)['direction'] != 'to_agent',
       );
 }
 

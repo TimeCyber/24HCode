@@ -720,50 +720,97 @@ export class Store {
 
   /**
    * 同一项目同一时间只允许一条指令处于 delivered/running；不同项目互不阻塞。
-   * Node 的同步 SQLite 操作保证检查与认领不会被另一个请求插入。
+   * BEGIN IMMEDIATE 将检查、回收和认领放入同一事务，避免多个 bridge 同时取走队列项。
    */
-  pullPrompts(projectId: string, limit = 1): PromptDelivery[] {
+  pullPrompts(
+    projectId: string,
+    limit = 1,
+    deliveryLeaseMs = 90_000,
+  ): PromptDelivery[] {
     const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 1));
-    const active = this.db
-      .prepare(
-        `SELECT 1 FROM prompt_deliveries
-         WHERE project_id = ? AND status IN ('delivered', 'running')
-         LIMIT 1`,
-      )
-      .get(projectId);
-    if (active) return [];
-
-    const rows = this.db
-      .prepare(
-        `SELECT id, prompt_id, project_id, content, status, created_at, updated_at, result, chat_session_id
-         FROM prompt_deliveries
-         WHERE project_id = ? AND status = 'queued'
-         ORDER BY created_at ASC
-         LIMIT ?`,
-      )
-      .all(projectId, safeLimit) as Array<Record<string, unknown>>;
-
-    const now = nowIso();
-    const deliveries = rows.map((row) => this.enrichDelivery(mapDelivery(row)));
-    for (const d of deliveries) {
-      this.db
+    const leaseMs = Math.max(30_000, Math.min(5 * 60_000, deliveryLeaseMs));
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const now = nowIso();
+      const recoverBefore = new Date(Date.now() - leaseMs).toISOString();
+      const abandoned = this.db
         .prepare(
-          `UPDATE prompt_deliveries SET status = 'delivered', updated_at = ? WHERE id = ?`,
+          `SELECT id, prompt_id FROM prompt_deliveries
+           WHERE project_id = ? AND status = 'delivered' AND updated_at <= ?`,
         )
-        .run(now, d.id);
-      this.db
-        .prepare(`UPDATE prompts SET status = 'delivered', updated_at = ? WHERE id = ?`)
-        .run(now, d.promptId);
-      d.status = "delivered";
-      d.updatedAt = now;
+        .all(projectId, recoverBefore) as Array<{ id: string; prompt_id: string }>;
+      const resetDelivery = this.db.prepare(
+        `UPDATE prompt_deliveries
+         SET status = 'queued', result = NULL, updated_at = ?
+         WHERE id = ? AND status = 'delivered'`,
+      );
+      const hasOtherActiveDelivery = this.db.prepare(
+        `SELECT 1 FROM prompt_deliveries
+         WHERE prompt_id = ? AND id <> ? AND status IN ('delivered', 'running')
+         LIMIT 1`,
+      );
+      const resetPrompt = this.db.prepare(
+        `UPDATE prompts SET status = 'queued', result = NULL, updated_at = ? WHERE id = ?`,
+      );
+      for (const row of abandoned) {
+        resetDelivery.run(now, row.id);
+        if (!hasOtherActiveDelivery.get(row.prompt_id, row.id)) {
+          resetPrompt.run(now, row.prompt_id);
+        }
+      }
+
+      const active = this.db
+        .prepare(
+          `SELECT 1 FROM prompt_deliveries
+           WHERE project_id = ? AND status IN ('delivered', 'running')
+           LIMIT 1`,
+        )
+        .get(projectId);
+      if (active) {
+        this.db.exec("COMMIT");
+        return [];
+      }
+
+      const rows = this.db
+        .prepare(
+          `SELECT id, prompt_id, project_id, content, status, created_at, updated_at, result, chat_session_id
+           FROM prompt_deliveries
+           WHERE project_id = ? AND status = 'queued'
+           ORDER BY created_at ASC, rowid ASC
+           LIMIT ?`,
+        )
+        .all(projectId, safeLimit) as Array<Record<string, unknown>>;
+
+      const deliveries = rows.map((row) => this.enrichDelivery(mapDelivery(row)));
+      for (const d of deliveries) {
+        this.db
+          .prepare(
+            `UPDATE prompt_deliveries SET status = 'delivered', updated_at = ? WHERE id = ?`,
+          )
+          .run(now, d.id);
+        this.db
+          .prepare(`UPDATE prompts SET status = 'delivered', updated_at = ? WHERE id = ?`)
+          .run(now, d.promptId);
+        d.status = "delivered";
+        d.updatedAt = now;
+      }
+      this.db.exec("COMMIT");
+      return deliveries;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* The transaction may already have been rolled back by SQLite. */
+      }
+      throw error;
     }
-    return deliveries;
   }
 
   ackPrompt(deliveryId: string): PromptDelivery | null {
     const now = nowIso();
     const existing = this.getDelivery(deliveryId);
     if (!existing) return null;
+    if (existing.status === "done" || existing.status === "failed") return existing;
     this.db
       .prepare(
         `UPDATE prompt_deliveries SET status = 'running', updated_at = ? WHERE id = ?`,
@@ -834,8 +881,11 @@ export class Store {
       .prepare(
         `SELECT id, prompt_id, project_id, content, status, created_at, updated_at, result, chat_session_id
          FROM prompt_deliveries
-         ORDER BY updated_at DESC
-         LIMIT ?`,
+         WHERE status IN ('queued', 'delivered', 'running') OR id IN (
+           SELECT id FROM prompt_deliveries
+           WHERE status IN ('done', 'failed') ORDER BY updated_at DESC LIMIT ?
+         )
+         ORDER BY updated_at DESC`,
       )
       .all(safeLimit) as Array<Record<string, unknown>>;
     return rows.map((row) => this.enrichDelivery(mapDelivery(row)));

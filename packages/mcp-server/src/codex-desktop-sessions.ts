@@ -23,6 +23,8 @@ type RpcMessage = {
 function findCodexCmd(): string | null {
   const override = process.env.CODEASSIST_CODEX_CMD?.trim();
   if (override && fs.existsSync(override)) return override;
+  const runtime = process.env.CODEX_APP_RUNTIME_CLI_PATH?.trim();
+  if (runtime && fs.existsSync(runtime)) return runtime;
   const local = process.env.LOCALAPPDATA ?? "";
   const binRoot = path.join(local, "OpenAI", "Codex", "bin");
   if (fs.existsSync(binRoot)) {
@@ -157,7 +159,7 @@ export function readCodexDesktopSessions(
     };
 
     const send = (message: Record<string, unknown>) => {
-      stdin.write(`${JSON.stringify(message)}\n`);
+      if (!finished && stdin.writable) stdin.write(`${JSON.stringify(message)}\n`);
     };
 
     const requestPage = (cursor: string | null) => {
@@ -176,6 +178,7 @@ export function readCodexDesktopSessions(
       });
     };
 
+    stdin.on("error", () => finish(null));
     child.on("error", () => finish(null));
     child.on("exit", () => {
       if (!finished) finish(null);

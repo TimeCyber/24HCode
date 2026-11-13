@@ -19,6 +19,18 @@ import type {
   UpdateChatSessionRequest,
 } from "@codeassist/shared";
 
+class RelayResponseError extends Error {
+  constructor(message: string, readonly retryable: boolean) {
+    super(message);
+  }
+}
+
+function canRetryCompletion(error: unknown): boolean {
+  if (error instanceof RelayResponseError) return error.retryable;
+  return error instanceof TypeError ||
+    (error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name));
+}
+
 export class ApiClient {
   constructor(
     private readonly baseUrl: string,
@@ -44,12 +56,27 @@ export class ApiClient {
       method,
       headers,
       body: serialized,
+      signal: AbortSignal.timeout(20_000),
     });
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`API ${method} ${path} failed: ${res.status} ${text}`);
+      throw new RelayResponseError(
+        `API ${method} ${path} failed: ${res.status} ${text}`,
+        res.status >= 500 || res.status === 429 || res.status === 408,
+      );
     }
-    return (await res.json()) as T;
+    const decoded = await res.json();
+    if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) {
+      if (decoded.error || (decoded.code !== undefined && decoded.code !== 200 && decoded.code !== "200")) {
+        const code = Number(decoded.code);
+        throw new RelayResponseError(
+          `API ${method} ${path} failed: ${decoded.msg || JSON.stringify(decoded.error || decoded.code)}`,
+          code >= 500 || code === 429 || code === 408,
+        );
+      }
+      if (decoded.code !== undefined && decoded.data !== undefined) return decoded.data as T;
+    }
+    return decoded as T;
   }
 
   registerProject(input: RegisterProjectRequest): Promise<Project> {
@@ -66,6 +93,14 @@ export class ApiClient {
 
   createTask(input: CreateTaskRequest): Promise<TaskEvent> {
     return this.request("POST", "/api/tasks", input);
+  }
+
+  listTasks(status?: string): Promise<TaskEvent[]> {
+    return this.request("GET", `/api/tasks${status ? `?status=${encodeURIComponent(status)}` : ""}`);
+  }
+
+  submitDecision(taskId: string, action: "approve" | "reject", comment?: string): Promise<unknown> {
+    return this.request("POST", `/api/tasks/${encodeURIComponent(taskId)}/decision`, { action, comment });
   }
 
   pullDecisions(projectId: string): Promise<Decision[]> {
@@ -86,15 +121,25 @@ export class ApiClient {
     return this.request("POST", `/api/mcp/prompts/${id}/ack`);
   }
 
-  completePrompt(
+  async completePrompt(
     id: string,
     status: "done" | "failed" = "done",
     result?: string,
   ): Promise<PromptDelivery> {
-    return this.request("POST", `/api/mcp/prompts/${id}/complete`, {
-      status,
-      result,
-    });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const delivery = await this.request<PromptDelivery>(
+          "POST", `/api/mcp/prompts/${id}/complete`, { status, result },
+        );
+        if (delivery?.id !== id || delivery.status !== status) {
+          throw new RelayResponseError("Relay did not confirm the requested delivery status", true);
+        }
+        return delivery;
+      } catch (error) {
+        if (attempt >= 2 || !canRetryCompletion(error)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+      }
+    }
   }
 
   syncSessionContext(

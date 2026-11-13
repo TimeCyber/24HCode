@@ -82,12 +82,6 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
     final fg = state == AppLifecycleState.resumed;
     unawaited(BackgroundWatchService.setAppForeground(fg));
     unawaited(CrashLogService.instance.log('lifecycle', state.name));
-    if (fg && mounted) {
-      final app = context.read<AppState>();
-      if (app.configured) {
-        unawaited(app.refreshAll());
-      }
-    }
   }
 
   void _onRootBack() {

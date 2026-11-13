@@ -11,6 +11,7 @@ import { ApiClient } from "./api-client.js";
 import { startLivePull } from "./live-pull.js";
 import { startCodexUsageReporter } from "./codex-usage.js";
 import { startCodexDesktopSessionReporter } from "./codex-desktop-sessions.js";
+import { MobileConfirmations } from "./mobile-confirmation.js";
 
 const SERVER_URL = (
   process.env.CODEASSIST_SERVER_URL ?? "http://127.0.0.1:8787"
@@ -364,6 +365,7 @@ async function syncProjectWorkers() {
 }
 
 function startProjectWorkerPolling() {
+  if (process.env.CODEASSIST_AGENT_CHILD === "1") return;
   if (projectWorkerTimer) return;
   void syncProjectWorkers();
   projectWorkerTimer = setInterval(
@@ -442,9 +444,46 @@ server.tool(
 );
 
 server.tool(
+  "request_client_decision",
+  "Ask the mobile user for an app-level choice or explicit operation confirmation and wait for their answer. CodeAssist-managed Codex App Server tasks relay native command, file, temporary permission, and MCP App tool confirmation requests separately. This tool itself does not grant sandbox permissions or answer approvals shown by the local IDE/Codex host before an MCP tool runs. Rejection/timeout means stop the proposed action.",
+  {
+    title: z.string().min(1).max(160),
+    detail: z.string().max(12000),
+    chatSessionId: z.string().optional(),
+    timeoutSeconds: z.number().int().min(30).max(1200).optional(),
+  },
+  async ({ title, detail, chatSessionId, timeoutSeconds }, extra) => {
+    const p = await ensureRegistered();
+    const peer = cloudPeerApi();
+    const target = peer ?? api;
+    await target.syncSessionContext({
+      projectId: p.id, chatSessionId, summary: title, currentStep: "等待手机确认", extra: detail,
+      status: "waiting_user", openFiles: [],
+    });
+    try {
+      const answer = await new MobileConfirmations(target, p.id).request(title, {
+        kind: "confirmation", reason: detail, chatSessionId, cwd: currentWorkspace(),
+      }, extra.signal, (timeoutSeconds ?? 600) * 1000);
+      await target.syncSessionContext({
+        projectId: p.id, chatSessionId, summary: title,
+        currentStep: answer.approved ? "手机已同意，等待PC继续执行" : "手机未同意，请停止该操作",
+        status: answer.approved ? "coding" : "blocked", extra: answer.comment || answer.reason, openFiles: [],
+      });
+      return { content: [{ type: "text", text: JSON.stringify(answer) }] };
+    } catch (error) {
+      await target.syncSessionContext({ projectId: p.id, chatSessionId, summary: title, status: "blocked", currentStep: "手机确认失败，请停止该操作", openFiles: [] }).catch(() => undefined);
+      throw error;
+    }
+  },
+);
+
+server.tool(
   "get_pending_prompts",
   "Fetch remote prompts submitted from the mobile client for this project. When prompts are returned, treat each content field as the user's current instruction and execute it immediately.",
   async () => {
+    if (process.env.CODEASSIST_AGENT_CHILD === "1") {
+      return { content: [{ type: "text", text: "No pending prompts. Current prompt is managed by CodeAssist bridge; do not claim another task." }] };
+    }
     const p = await ensureRegistered();
     startPolling();
     const fresh = await api.pullPrompts(p.id);
@@ -554,6 +593,13 @@ server.tool(
       .optional()
       .describe("Target mobile chat session; defaults to the project's latest session"),
     mimeType: z.string().optional().describe("Optional MIME type override"),
+  },
+  {
+    title: "发送文件到手机客户端",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
   },
   async ({ filePath, chatSessionId, mimeType }) => {
     const p = await ensureRegistered();
